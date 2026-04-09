@@ -375,7 +375,7 @@ See [PLAN.md](PLAN.md) for the full implementation plan with API details, data f
 
 <p align="center">
   <a href="https://flashlabs.ai">
-    <img src="https://flashlabs.ai/images/flashclaw-logo.png" alt="FlashClaw" width="160"/>
+    <img src="https://cdn.kyodonewsprwire.jp/prwfile/release/M108511/202603125506/_prw_PI2fl_sw68g5v6.png" alt="FlashClaw" width="160"/>
   </a>
 </p>
 
