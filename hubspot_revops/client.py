@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from dotenv import load_dotenv
 from hubspot import HubSpot
 from hubspot.crm.contacts import PublicObjectSearchRequest
+from urllib3.util.retry import Retry
 
 
 load_dotenv()
@@ -43,9 +44,12 @@ class HubSpotClient:
                 "HUBSPOT_ACCESS_TOKEN is required. "
                 "Set it as an environment variable or pass it to HubSpotClient()."
             )
-        self.api = HubSpot(access_token=self.access_token)
+        retry = Retry(total=3, backoff_factor=0.3, status_forcelist=(429, 500, 502, 504))
+        self.api = HubSpot(access_token=self.access_token, retry=retry)
         rate_limit = int(os.environ.get("HUBSPOT_RATE_LIMIT", "100"))
         self.rate_limiter = RateLimiter(max_requests=rate_limit)
+        # CRM Search API has a stricter limit: 5 req/sec (account-level)
+        self.search_rate_limiter = RateLimiter(max_requests=5, window_seconds=1.0)
 
     def _rate_limited(self, func, *args, **kwargs):
         """Execute an API call with rate limiting."""
@@ -70,18 +74,20 @@ class HubSpotClient:
         filter_groups: list[dict],
         properties: list[str] | None = None,
         sorts: list[dict] | None = None,
-        limit: int = 100,
+        limit: int = 200,
         after: str | None = None,
     ):
-        """Search CRM objects with filters."""
+        """Search CRM objects with filters. Max 200 per page, 10K total per query."""
         request = PublicObjectSearchRequest(
             filter_groups=filter_groups,
             properties=properties or [],
             sorts=sorts or [],
-            limit=limit,
+            limit=min(limit, 200),
             after=after or "0",
         )
         search_api = getattr(self.api.crm, _sdk_module(object_type), self.api.crm.objects)
+        # Search API has its own 5 req/sec rate limit
+        self.search_rate_limiter.wait_if_needed()
         return self._rate_limited(search_api.search_api.do_search, public_object_search_request=request)
 
     # --- Properties / Schema ---
@@ -104,8 +110,8 @@ class HubSpotClient:
 
     # --- Owners ---
 
-    def get_owners(self, limit: int = 100):
-        """Get all HubSpot owners."""
+    def get_owners(self, limit: int = 500):
+        """Get all HubSpot owners (max 500 per page)."""
         return self._rate_limited(self.api.crm.owners.owners_api.get_page, limit=limit)
 
     # --- Associations ---
