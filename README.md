@@ -1,1 +1,1 @@
-# RevOps-CRM-Analyst-Skill-Sales-Pipeline-Forecast-Reports-Closed-Won-Closed-Lost-Analysis-etc.-
+# RevOps-CRM-Analyst-Skill
