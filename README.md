@@ -1,7 +1,7 @@
 # RevOps CRM Analyst Skill for HubSpot
 
 <p align="center">
-  <img src="https://flashlabs.ai/images/flashclaw-logo.png" alt="FlashClaw Logo" width="200"/>
+  <img src="https://cdn.kyodonewsprwire.jp/prwfile/release/M108511/202603125506/_prw_PI2fl_sw68g5v6.png" alt="FlashClaw Logo" width="200"/>
 </p>
 
 <p align="center">
