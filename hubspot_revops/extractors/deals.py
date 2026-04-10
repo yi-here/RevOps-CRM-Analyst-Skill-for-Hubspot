@@ -26,6 +26,19 @@ DEAL_PROPERTIES = [
     "hs_tcv",
 ]
 
+# Extra properties requested only by the closed-lost report so we do not
+# bloat every deal query site-wide.
+CLOSED_LOST_PROPERTIES = DEAL_PROPERTIES + [
+    "closed_lost_reason",
+    "notes_last_contacted",
+    "notes_last_updated",
+]
+
+# Extra properties requested only by the forecast-bucket report.
+FORECAST_BUCKET_PROPERTIES = DEAL_PROPERTIES + [
+    "hs_next_step",
+]
+
 
 class DealExtractor(BaseExtractor):
     object_type = "deals"

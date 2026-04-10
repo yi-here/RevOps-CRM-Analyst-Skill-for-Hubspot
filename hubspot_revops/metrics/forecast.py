@@ -5,16 +5,27 @@ from __future__ import annotations
 import pandas as pd
 
 from hubspot_revops.extractors.deals import DealExtractor
+from hubspot_revops.metrics._utils import to_numeric_series
 from hubspot_revops.schema.models import CRMSchema
 
 
-def weighted_pipeline(deal_extractor: DealExtractor, schema: CRMSchema) -> dict:
+def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFrame:
+    if pipeline_filter and not df.empty and "pipeline" in df.columns:
+        return df[df["pipeline"] == pipeline_filter]
+    return df
+
+
+def weighted_pipeline(
+    deal_extractor: DealExtractor,
+    schema: CRMSchema,
+    pipeline_filter: str | None = None,
+) -> dict:
     """Calculate weighted pipeline value using stage probabilities."""
-    df = deal_extractor.get_open_deals()
+    df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
     if df.empty:
         return {"weighted_value": 0.0, "unweighted_value": 0.0, "deal_count": 0}
 
-    df["amount"] = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0)
+    df["amount"] = to_numeric_series(df, "amount")
 
     # Build stage → probability map
     prob_map = {}
@@ -33,15 +44,20 @@ def weighted_pipeline(deal_extractor: DealExtractor, schema: CRMSchema) -> dict:
     }
 
 
-def forecast_by_category(deal_extractor: DealExtractor) -> pd.DataFrame:
+def forecast_by_category(
+    deal_extractor: DealExtractor, pipeline_filter: str | None = None
+) -> pd.DataFrame:
     """Break down pipeline by HubSpot forecast category."""
-    df = deal_extractor.get_open_deals(
-        properties=["amount", "hs_forecast_category", "dealstage", "dealname"]
+    df = _filter_pipeline(
+        deal_extractor.get_open_deals(
+            properties=["amount", "hs_forecast_category", "dealstage", "dealname", "pipeline"]
+        ),
+        pipeline_filter,
     )
     if df.empty:
         return pd.DataFrame()
 
-    df["amount"] = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0)
+    df["amount"] = to_numeric_series(df, "amount")
 
     category_col = "hs_forecast_category"
     if category_col not in df.columns:

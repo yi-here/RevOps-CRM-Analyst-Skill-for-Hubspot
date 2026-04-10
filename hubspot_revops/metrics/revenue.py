@@ -6,15 +6,28 @@ import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import DealExtractor
+from hubspot_revops.metrics._utils import to_numeric_series
 
 
-def closed_revenue(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
+def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFrame:
+    if pipeline_filter and not df.empty and "pipeline" in df.columns:
+        return df[df["pipeline"] == pipeline_filter]
+    return df
+
+
+def closed_revenue(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None = None,
+) -> dict:
     """Total closed-won revenue in a period."""
-    won = deal_extractor.get_closed_deals(time_range, won_only=True)
+    won = _filter_pipeline(
+        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
+    )
     if won.empty:
         return {"total_revenue": 0.0, "deal_count": 0}
 
-    won["amount"] = pd.to_numeric(won.get("amount", 0), errors="coerce").fillna(0)
+    won["amount"] = to_numeric_series(won, "amount")
     return {
         "total_revenue": won["amount"].sum(),
         "deal_count": len(won),
@@ -24,13 +37,20 @@ def closed_revenue(deal_extractor: DealExtractor, time_range: TimeRange) -> dict
     }
 
 
-def revenue_by_owner(deal_extractor: DealExtractor, time_range: TimeRange, owners: dict) -> pd.DataFrame:
+def revenue_by_owner(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    owners: dict,
+    pipeline_filter: str | None = None,
+) -> pd.DataFrame:
     """Revenue grouped by deal owner."""
-    won = deal_extractor.get_closed_deals(time_range, won_only=True)
+    won = _filter_pipeline(
+        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
+    )
     if won.empty:
         return pd.DataFrame()
 
-    won["amount"] = pd.to_numeric(won.get("amount", 0), errors="coerce").fillna(0)
+    won["amount"] = to_numeric_series(won, "amount")
     grouped = won.groupby("hubspot_owner_id").agg(
         total_revenue=("amount", "sum"),
         deal_count=("id", "count"),
@@ -49,24 +69,32 @@ def revenue_by_pipeline(deal_extractor: DealExtractor, time_range: TimeRange) ->
     if won.empty:
         return pd.DataFrame()
 
-    won["amount"] = pd.to_numeric(won.get("amount", 0), errors="coerce").fillna(0)
+    won["amount"] = to_numeric_series(won, "amount")
     return won.groupby("pipeline").agg(
         total_revenue=("amount", "sum"),
         deal_count=("id", "count"),
     ).reset_index().sort_values("total_revenue", ascending=False)
 
 
-def mrr_arr_from_deals(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
+def mrr_arr_from_deals(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None = None,
+) -> dict:
     """Extract MRR/ARR from deal properties (if populated)."""
-    won = deal_extractor.get_closed_deals(
-        time_range, won_only=True,
-        properties=["amount", "hs_mrr", "hs_arr", "hs_acv", "closedate"],
+    won = _filter_pipeline(
+        deal_extractor.get_closed_deals(
+            time_range,
+            won_only=True,
+            properties=["amount", "hs_mrr", "hs_arr", "hs_acv", "closedate", "pipeline"],
+        ),
+        pipeline_filter,
     )
     if won.empty:
         return {"mrr": 0.0, "arr": 0.0}
 
     for col in ["hs_mrr", "hs_arr"]:
-        won[col] = pd.to_numeric(won.get(col, 0), errors="coerce").fillna(0)
+        won[col] = to_numeric_series(won, col)
 
     return {
         "mrr": won["hs_mrr"].sum(),
