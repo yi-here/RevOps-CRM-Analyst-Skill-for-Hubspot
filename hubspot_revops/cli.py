@@ -57,15 +57,33 @@ def main() -> None:
     report_parser = subparsers.add_parser("report", help="Generate a report")
     report_parser.add_argument(
         "type",
-        choices=["pipeline", "revenue", "funnel", "team", "activity", "executive"],
+        choices=[
+            "pipeline",
+            "revenue",
+            "funnel",
+            "team",
+            "activity",
+            "executive",
+            "closedlost",
+            "forecast",
+            "meetings",
+        ],
         help="Report type",
     )
     report_parser.add_argument("--period", help="Time period (e.g., 90d, 6m, Q1-2026)")
+    report_parser.add_argument(
+        "--pipeline",
+        help="Pipeline label or ID (case-insensitive). Use 'all' or omit for every pipeline.",
+    )
 
     # Ask command
     ask_parser = subparsers.add_parser("ask", help="Ask a natural language question")
     ask_parser.add_argument("question", help="Your question about business metrics")
     ask_parser.add_argument("--period", help="Time period (e.g., 90d, 6m, Q1-2026)")
+    ask_parser.add_argument(
+        "--pipeline",
+        help="Pipeline label or ID to scope the answer to (case-insensitive).",
+    )
 
     args = parser.parse_args()
 
@@ -85,6 +103,7 @@ def main() -> None:
 
     if args.command == "report":
         tr = parse_time_range(getattr(args, "period", None))
+        pipeline_arg = getattr(args, "pipeline", None)
         reports = {
             "pipeline": generator.pipeline_report,
             "revenue": generator.revenue_report,
@@ -92,12 +111,20 @@ def main() -> None:
             "team": generator.rep_scorecard_report,
             "activity": generator.activity_report,
             "executive": generator.executive_summary,
+            "closedlost": generator.closed_lost_report,
+            "forecast": generator.forecast_report,
+            "meetings": generator.meetings_report,
         }
-        print(reports[args.type](time_range=tr))
+        print(reports[args.type](time_range=tr, pipeline_id=pipeline_arg))
 
     elif args.command == "ask":
         tr = parse_time_range(getattr(args, "period", None))
-        print(answer_question(args.question, generator, time_range=tr))
+        pipeline_arg = getattr(args, "pipeline", None)
+        print(
+            answer_question(
+                args.question, generator, time_range=tr, pipeline_id=pipeline_arg
+            )
+        )
 
 
 if __name__ == "__main__":

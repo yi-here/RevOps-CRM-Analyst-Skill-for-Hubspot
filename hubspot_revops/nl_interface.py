@@ -7,7 +7,6 @@ that works well when the LLM has already done intent parsing.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 
 from hubspot_revops.extractors.base import TimeRange
@@ -18,7 +17,7 @@ from hubspot_revops.reports.generator import ReportGenerator
 class QueryIntent:
     """Parsed intent from a natural language question."""
 
-    report_type: str  # pipeline, revenue, funnel, team, activity, forecast, executive
+    report_type: str  # pipeline, revenue, funnel, team, activity, forecast, executive, closed_lost, meetings
     metric: str | None = None  # Specific metric within the report
     time_range: TimeRange | None = None
     filters: dict | None = None  # e.g., {"owner": "John", "pipeline": "Sales"}
@@ -30,8 +29,10 @@ REPORT_KEYWORDS = {
     "revenue": ["revenue", "closed won", "mrr", "arr", "recurring", "bookings", "closed revenue"],
     "funnel": ["funnel", "conversion", "mql", "sql", "lifecycle", "lead source", "leads"],
     "team": ["rep", "reps", "team", "scorecard", "quota", "performance", "top performer", "rep scorecard"],
-    "activity": ["activity", "activities", "calls", "emails", "meetings", "engagement", "touches"],
+    "activity": ["activity", "activities", "calls", "emails", "engagement", "touches"],
     "forecast": ["forecast", "weighted", "commit", "best case", "prediction"],
+    "closed_lost": ["lost deals", "closed lost", "losses", "loss reason", "lost reason", "churn reason"],
+    "meetings": ["meetings", "meeting history", "meeting count", "effort sink"],
     "executive": ["summary", "overview", "executive", "dashboard", "health", "how are we doing"],
 }
 
@@ -69,7 +70,12 @@ def classify_question(question: str) -> QueryIntent:
     return QueryIntent(report_type=report_type, metric=metric)
 
 
-def answer_question(question: str, generator: ReportGenerator, time_range: TimeRange | None = None) -> str:
+def answer_question(
+    question: str,
+    generator: ReportGenerator,
+    time_range: TimeRange | None = None,
+    pipeline_id: str | None = None,
+) -> str:
     """Route a natural language question to the appropriate report."""
     intent = classify_question(question)
 
@@ -79,9 +85,11 @@ def answer_question(question: str, generator: ReportGenerator, time_range: TimeR
         "funnel": generator.funnel_report,
         "team": generator.rep_scorecard_report,
         "activity": generator.activity_report,
-        "forecast": generator.pipeline_report,  # Forecast is part of pipeline for now
+        "forecast": generator.forecast_report,
+        "closed_lost": generator.closed_lost_report,
+        "meetings": generator.meetings_report,
         "executive": generator.executive_summary,
     }
 
     method = report_methods.get(intent.report_type, generator.executive_summary)
-    return method(time_range=time_range)
+    return method(time_range=time_range, pipeline_id=pipeline_id)

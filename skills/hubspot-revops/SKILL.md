@@ -64,11 +64,40 @@ When the user asks a business question, route it to the right report:
 | Revenue, bookings, closed-won | `python -m hubspot_revops.cli report revenue` |
 | Funnel, leads, MQL, SQL, conversion | `python -m hubspot_revops.cli report funnel` |
 | Reps, team, quota, scorecard | `python -m hubspot_revops.cli report team` |
-| Calls, emails, meetings, activity | `python -m hubspot_revops.cli report activity` |
+| Calls, emails, activity | `python -m hubspot_revops.cli report activity` |
+| Lost deals, loss reasons, ghost deals | `python -m hubspot_revops.cli report closedlost` |
+| Current-month forecast (Commit / Highly Likely / Best Case) | `python -m hubspot_revops.cli report forecast` |
+| Meeting history, effort sinks | `python -m hubspot_revops.cli report meetings` |
 | General summary, overview | `python -m hubspot_revops.cli report executive` |
 | Anything else | `python -m hubspot_revops.cli ask "USER_QUESTION"` |
 
 Add `--period` for time ranges: `Q1-2026`, `90d`, `6m`, `30d`.
+
+Add `--pipeline <name-or-id>` to scope any report to a single pipeline
+(e.g. `--pipeline japan`, `--pipeline enterprise`). Matching is
+case-insensitive on the pipeline label, with substring fallback. Use
+`--pipeline all` or omit the flag to include every pipeline. This is
+important in portals with multiple pipelines — otherwise Japan (JPY) and
+US (USD) deal metrics get mixed.
+
+## Data quality requirements
+
+The closed-lost report groups losses by `closed_lost_reason`. If this
+field is not enforced as required in HubSpot, the reason breakdown will
+be dominated by a `(no reason)` bucket and the report will emit a
+**data quality warning** when fewer than 50% of lost deals have a
+reason populated. To make the report meaningful:
+
+1. In HubSpot, mark `closed_lost_reason` as **required** on the deal
+   properties settings page.
+2. Populate the option list with the reasons your team actually uses
+   (Price, Competitor, Timing, No decision, etc.).
+3. Backfill historical deals where possible.
+
+The report's `lost_reason_coverage` metric shows the percentage of lost
+deals with a non-empty reason, so you can track improvement over time.
+Ghost deal count (closed-lost with zero associated engagements) is
+surfaced in the same report for pipeline hygiene.
 
 ## Report Interpretation
 

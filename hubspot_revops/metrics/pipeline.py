@@ -8,16 +8,25 @@ import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import DealExtractor
+from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
 from hubspot_revops.schema.models import CRMSchema
 
 
-def total_pipeline_value(deal_extractor: DealExtractor) -> dict:
+def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFrame:
+    if pipeline_filter and not df.empty and "pipeline" in df.columns:
+        return df[df["pipeline"] == pipeline_filter]
+    return df
+
+
+def total_pipeline_value(
+    deal_extractor: DealExtractor, pipeline_filter: str | None = None
+) -> dict:
     """Calculate total open pipeline value."""
-    df = deal_extractor.get_open_deals()
+    df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
     if df.empty:
         return {"total_deals": 0, "total_value": 0.0}
 
-    df["amount"] = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0)
+    df["amount"] = to_numeric_series(df, "amount")
     return {
         "total_deals": len(df),
         "total_value": df["amount"].sum(),
@@ -25,38 +34,62 @@ def total_pipeline_value(deal_extractor: DealExtractor) -> dict:
     }
 
 
-def pipeline_by_stage(deal_extractor: DealExtractor, schema: CRMSchema) -> pd.DataFrame:
-    """Break down open pipeline by stage."""
-    df = deal_extractor.get_open_deals()
+def pipeline_by_stage(
+    deal_extractor: DealExtractor,
+    schema: CRMSchema,
+    pipeline_filter: str | None = None,
+) -> pd.DataFrame:
+    """Break down open pipeline by stage (pipeline-aware, no label collisions)."""
+    df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
     if df.empty:
         return pd.DataFrame()
 
-    df["amount"] = pd.to_numeric(df.get("amount", 0), errors="coerce").fillna(0)
+    df["amount"] = to_numeric_series(df, "amount")
 
-    # Map stage IDs to labels
-    stage_labels = {}
+    # Build a (pipeline_id, stage_id) -> (stage_label, pipeline_label) map.
+    # Stages can share labels across pipelines ("Qualified" in both Sales and
+    # Japan), so we disambiguate by joining on both keys and include the
+    # pipeline label in the output row to keep them distinct.
+    stage_info: dict[tuple[str, str], tuple[str, str]] = {}
     for pipelines in schema.pipelines.values():
         for pl in pipelines:
             for s in pl.stages:
-                stage_labels[s.stage_id] = s.label
+                stage_info[(pl.pipeline_id, s.stage_id)] = (s.label, pl.label)
 
-    grouped = df.groupby("dealstage").agg(
+    group_cols = ["pipeline", "dealstage"] if "pipeline" in df.columns else ["dealstage"]
+    grouped = df.groupby(group_cols).agg(
         deal_count=("id", "count"),
         total_value=("amount", "sum"),
         avg_value=("amount", "mean"),
     ).reset_index()
 
-    grouped["stage_label"] = grouped["dealstage"].map(stage_labels).fillna(grouped["dealstage"])
+    def _lookup_label(row: pd.Series) -> str:
+        key = (row.get("pipeline", ""), row["dealstage"])
+        label, pl_label = stage_info.get(key, (row["dealstage"], ""))
+        return f"{label} ({pl_label})" if pl_label else label
+
+    def _lookup_pipeline_label(row: pd.Series) -> str:
+        key = (row.get("pipeline", ""), row["dealstage"])
+        _, pl_label = stage_info.get(key, ("", ""))
+        return pl_label
+
+    grouped["stage_label"] = grouped.apply(_lookup_label, axis=1)
+    grouped["pipeline_label"] = grouped.apply(_lookup_pipeline_label, axis=1)
     return grouped.sort_values("total_value", ascending=False)
 
 
-def win_rate(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
+def win_rate(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None = None,
+) -> dict:
     """Calculate win rate for deals closed in a time period."""
-    closed = deal_extractor.get_closed_deals(time_range)
+    closed = _filter_pipeline(deal_extractor.get_closed_deals(time_range), pipeline_filter)
     if closed.empty:
         return {"win_rate": 0.0, "won": 0, "lost": 0, "total_closed": 0}
 
-    won = closed[closed.get("hs_is_closed_won", "false").astype(str) == "true"]
+    won_mask = to_bool_series(closed, "hs_is_closed_won")
+    won = closed[won_mask]
     lost_count = len(closed) - len(won)
     rate = len(won) / len(closed) if len(closed) > 0 else 0
 
@@ -68,13 +101,19 @@ def win_rate(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
     }
 
 
-def avg_deal_size(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
+def avg_deal_size(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None = None,
+) -> dict:
     """Calculate average deal size for won deals in a period."""
-    won = deal_extractor.get_closed_deals(time_range, won_only=True)
+    won = _filter_pipeline(
+        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
+    )
     if won.empty:
         return {"avg_deal_size": 0.0, "total_revenue": 0.0, "deal_count": 0}
 
-    won["amount"] = pd.to_numeric(won.get("amount", 0), errors="coerce").fillna(0)
+    won["amount"] = to_numeric_series(won, "amount")
     return {
         "avg_deal_size": won["amount"].mean(),
         "total_revenue": won["amount"].sum(),
@@ -82,9 +121,15 @@ def avg_deal_size(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
     }
 
 
-def sales_cycle_length(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
+def sales_cycle_length(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None = None,
+) -> dict:
     """Calculate average sales cycle length for won deals."""
-    won = deal_extractor.get_closed_deals(time_range, won_only=True)
+    won = _filter_pipeline(
+        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
+    )
     if won.empty:
         return {"avg_days": 0, "median_days": 0, "deal_count": 0}
 
@@ -100,13 +145,17 @@ def sales_cycle_length(deal_extractor: DealExtractor, time_range: TimeRange) -> 
     }
 
 
-def pipeline_velocity(deal_extractor: DealExtractor, time_range: TimeRange) -> dict:
+def pipeline_velocity(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None = None,
+) -> dict:
     """Calculate pipeline velocity = (deals * win_rate * avg_size) / avg_cycle."""
-    wr = win_rate(deal_extractor, time_range)
-    ads = avg_deal_size(deal_extractor, time_range)
-    scl = sales_cycle_length(deal_extractor, time_range)
+    wr = win_rate(deal_extractor, time_range, pipeline_filter=pipeline_filter)
+    ads = avg_deal_size(deal_extractor, time_range, pipeline_filter=pipeline_filter)
+    scl = sales_cycle_length(deal_extractor, time_range, pipeline_filter=pipeline_filter)
 
-    open_pipeline = total_pipeline_value(deal_extractor)
+    open_pipeline = total_pipeline_value(deal_extractor, pipeline_filter=pipeline_filter)
     num_deals = open_pipeline["total_deals"]
     win_pct = wr["win_rate"] / 100
     avg_size = ads["avg_deal_size"]

@@ -34,9 +34,29 @@ def get_deal_pipelines(client: HubSpotClient) -> list[Pipeline]:
 
 
 def get_stage_map(pipelines: list[Pipeline]) -> dict[str, PipelineStage]:
-    """Build a mapping from stage_id → PipelineStage for quick lookup."""
+    """Build a flat mapping from stage_id → PipelineStage.
+
+    Kept for backward compatibility. If two pipelines share a stage ID the
+    second one wins; prefer ``get_stage_map_by_pipeline`` to preserve the
+    pipeline context.
+    """
     stage_map = {}
     for p in pipelines:
         for s in p.stages:
             stage_map[s.stage_id] = s
+    return stage_map
+
+
+def get_stage_map_by_pipeline(
+    pipelines: list[Pipeline],
+) -> dict[tuple[str, str], PipelineStage]:
+    """Mapping from (pipeline_id, stage_id) → PipelineStage.
+
+    Preserves pipeline context so stages sharing a label or ID across
+    pipelines stay distinct. Used by pipeline-aware metrics.
+    """
+    stage_map: dict[tuple[str, str], PipelineStage] = {}
+    for p in pipelines:
+        for s in p.stages:
+            stage_map[(p.pipeline_id, s.stage_id)] = s
     return stage_map

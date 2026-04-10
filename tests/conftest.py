@@ -68,10 +68,22 @@ def sample_schema():
                         PipelineStage(stage_id="demo", label="Demo Scheduled", display_order=1, probability=40),
                         PipelineStage(stage_id="proposal", label="Proposal Sent", display_order=2, probability=60),
                         PipelineStage(stage_id="negotiation", label="Negotiation", display_order=3, probability=80),
-                        PipelineStage(stage_id="closedwon", label="Closed Won", display_order=4, probability=100, is_closed=True, is_won=True),
-                        PipelineStage(stage_id="closedlost", label="Closed Lost", display_order=5, probability=0, is_closed=True, is_won=False),
+                        PipelineStage(stage_id="contract_sent", label="Contract Sent", display_order=4, probability=90),
+                        PipelineStage(stage_id="closedwon", label="Closed Won", display_order=5, probability=100, is_closed=True, is_won=True),
+                        PipelineStage(stage_id="closedlost", label="Closed Lost", display_order=6, probability=0, is_closed=True, is_won=False),
                     ],
-                )
+                ),
+                Pipeline(
+                    pipeline_id="japan",
+                    label="Japan Sales Pipeline",
+                    display_order=1,
+                    stages=[
+                        PipelineStage(stage_id="japan_qualified", label="Qualified", display_order=0, probability=20),
+                        PipelineStage(stage_id="japan_proposal", label="Proposal", display_order=1, probability=50),
+                        PipelineStage(stage_id="japan_closedwon", label="Closed Won", display_order=2, probability=100, is_closed=True, is_won=True),
+                        PipelineStage(stage_id="japan_closedlost", label="Closed Lost", display_order=3, probability=0, is_closed=True, is_won=False),
+                    ],
+                ),
             ]
         },
         owners={
