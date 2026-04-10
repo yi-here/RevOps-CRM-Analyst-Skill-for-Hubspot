@@ -54,6 +54,29 @@ cd {baseDir}/../../ && pip install -e . 2>/dev/null || pip install -e {baseDir}/
 cd {baseDir}/../../ && python -m hubspot_revops.cli schema
 ```
 
+## Companion MCP (Recommended)
+
+Install HubSpot's official MCP server alongside this skill. It exposes the
+raw CRM read tools (record lookups, filtered searches, engagement fetches)
+that this skill deliberately doesn't duplicate:
+
+```bash
+claude mcp add --transport http hubspot https://mcp.hubspot.com/anthropic
+```
+
+When both are available, route the user's question to the right surface:
+
+| User asks about | Use |
+|---|---|
+| "Find deal XYZ", "Show me this contact", filtered record searches | **HubSpot MCP** tools (`search_deals`, `get_deal`, `search_contacts`, `get_company`, `get_engagements`) |
+| Pipeline, revenue, win rate, forecast, closed-lost, meetings, team scorecard | **This skill's CLI** — deterministic pandas engines, locked report templates |
+| Cross-referencing multiple custom properties on a handful of records | HubSpot MCP |
+| Audit-grade numbers that must match week over week | This skill |
+
+The two compose: pull a specific deal via HubSpot MCP, then invoke this
+skill's CLI for the deterministic quarter total. If HubSpot's MCP is not
+installed, fall back to this skill's CLI for everything.
+
 ## Answering Questions
 
 When the user asks a business question, route it to the right report:
