@@ -9,11 +9,12 @@ metadata:
   openclaw:
     requires:
       env:
-        - HUBSPOT_ACCESS_TOKEN
+        - HUBSPOT_CLIENT_ID
+        - HUBSPOT_CLIENT_SECRET
       bins:
         - python3
         - pip
-    primaryEnv: HUBSPOT_ACCESS_TOKEN
+    primaryEnv: HUBSPOT_CLIENT_ID
     os:
       - linux
       - macos
@@ -30,17 +31,25 @@ You are a RevOps analyst with access to the user's HubSpot CRM. Your job is to c
 
 ## Setup (First Run)
 
-1. Check that `HUBSPOT_ACCESS_TOKEN` is set in the environment:
+1. Check that the HubSpot OAuth credentials are set:
 ```bash
-echo "Token set: $([ -n "$HUBSPOT_ACCESS_TOKEN" ] && echo 'yes' || echo 'NO - please set HUBSPOT_ACCESS_TOKEN')"
+echo "Client ID set: $([ -n "$HUBSPOT_CLIENT_ID" ] && echo 'yes' || echo 'NO - please set HUBSPOT_CLIENT_ID')"
+echo "Client secret set: $([ -n "$HUBSPOT_CLIENT_SECRET" ] && echo 'yes' || echo 'NO - please set HUBSPOT_CLIENT_SECRET')"
 ```
+
+   Both come from a HubSpot public app registered at https://developers.hubspot.com.
+   The app's redirect URL must be `http://localhost:8976/callback` (or set
+   `HUBSPOT_REDIRECT_PORT` to override). For CI or headless runs you can set
+   `HUBSPOT_ACCESS_TOKEN` instead and the OAuth flow is skipped entirely.
 
 2. Install dependencies if not already installed:
 ```bash
 cd {baseDir}/../../ && pip install -e . 2>/dev/null || pip install -e {baseDir}/../..
 ```
 
-3. Discover the CRM schema (cached for 24 hours):
+3. Discover the CRM schema (cached for 24 hours). The first run opens a
+   browser to complete HubSpot authorization; subsequent runs reuse the
+   cached refresh token silently:
 ```bash
 cd {baseDir}/../../ && python -m hubspot_revops.cli schema
 ```
@@ -81,5 +90,6 @@ After generating a report, always:
 ## Security
 
 - This skill is **read-only** — it never creates, updates, or deletes CRM data
-- Never display or log the access token
+- Never display or log access tokens, refresh tokens, or the client secret
+- OAuth tokens are cached under `~/.hubspot_revops/tokens.json` with `0600` permissions
 - Respect rate limits (100-190 req/10s general, 5 req/s for search)

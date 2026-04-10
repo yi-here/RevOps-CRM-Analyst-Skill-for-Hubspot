@@ -65,7 +65,7 @@ Revenue Operations teams spend hours pulling data from HubSpot, building spreads
           └────────────────────────────────────────────────────────┘
 ```
 
-1. **Connects** to HubSpot via Private App token (read-only, secure)
+1. **Connects** to HubSpot via OAuth 2.0 (browser-based, read-only, secure)
 2. **Auto-discovers** your CRM schema — objects, properties, pipelines, associations
 3. **Computes 40+ RevOps metrics** across pipeline, revenue, funnel, activity, and team
 4. **Answers natural-language questions** — no SQL, no code, just ask
@@ -104,15 +104,24 @@ cp -r skills/hubspot-revops /your/workspace/.agents/skills/
 
 ### Configure
 
-Set your HubSpot token in your OpenClaw/FlashClaw environment:
+Register a HubSpot public app at https://developers.hubspot.com (see
+[HubSpot Setup](#hubspot-setup) below) and set the client ID and secret in
+your OpenClaw/FlashClaw environment:
 
 ```bash
 # OpenClaw
-export HUBSPOT_ACCESS_TOKEN=pat-na1-xxxxxxxx
+export HUBSPOT_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+export HUBSPOT_CLIENT_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 # FlashClaw — use the secrets dashboard or:
-flashclaw secret set HUBSPOT_ACCESS_TOKEN pat-na1-xxxxxxxx
+flashclaw secret set HUBSPOT_CLIENT_ID xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+flashclaw secret set HUBSPOT_CLIENT_SECRET xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ```
+
+On first run the skill opens a browser to complete HubSpot authorization;
+tokens are cached under `~/.hubspot_revops/tokens.json` and refreshed
+silently on subsequent runs. For fully headless CI, set
+`HUBSPOT_ACCESS_TOKEN` instead and the OAuth flow is skipped.
 
 ### Use It
 
@@ -144,7 +153,7 @@ skills/hubspot-revops/
     └── install.sh        # Dependency installer
 ```
 
-The `SKILL.md` declares `HUBSPOT_ACCESS_TOKEN` as a required env var, `python3` as a required binary, and includes full instructions for the agent to discover schema, run reports, and interpret results.
+The `SKILL.md` declares `HUBSPOT_CLIENT_ID` and `HUBSPOT_CLIENT_SECRET` as required env vars, `python3` as a required binary, and includes full instructions for the agent to discover schema, run reports, and interpret results.
 
 ---
 
@@ -168,10 +177,13 @@ cd RevOps-CRM-Analyst-Skill-for-Hubspot
 # 2. Install dependencies
 pip install -e .
 
-# 3. Set your HubSpot token
-export HUBSPOT_ACCESS_TOKEN=pat-na1-xxxxxxxx
+# 3. Set your HubSpot OAuth credentials
+#    (Register a public app at https://developers.hubspot.com — see HubSpot Setup below)
+export HUBSPOT_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+export HUBSPOT_CLIENT_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
 # 4. Open Claude Code in this directory
+#    (The first slash-command invocation will open a browser for HubSpot authorization.)
 claude
 ```
 
@@ -211,10 +223,12 @@ claude
 # Install
 pip install -e .
 
-# Set your HubSpot Private App token
-export HUBSPOT_ACCESS_TOKEN=pat-na1-xxxxxxxx
+# Set your HubSpot OAuth app credentials
+# (Register a public app at https://developers.hubspot.com — see HubSpot Setup below)
+export HUBSPOT_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+export HUBSPOT_CLIENT_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 
-# Discover your schema
+# Discover your schema (first run opens a browser to authorize)
 python -m hubspot_revops.cli schema
 
 # Run reports
@@ -297,15 +311,23 @@ python -m hubspot_revops.cli ask "Show me pipeline by stage"
 
 ## HubSpot Setup
 
-### Create a Private App
+### Register a HubSpot OAuth App
 
-1. Go to **Settings → Integrations → Private Apps** in your HubSpot portal
-2. Click **Create a private app**
-3. Name it (e.g., "RevOps Analyst")
-4. Under **Scopes**, select these **read-only** permissions:
+The skill authenticates via OAuth 2.0 against a HubSpot public app that you
+register once in your own HubSpot developer account. The app stays yours —
+client ID and secret never leave your environment, and tokens are cached
+locally under `~/.hubspot_revops/tokens.json` with `0600` permissions.
+
+1. Go to https://developers.hubspot.com. If you do not already have a
+   developer account, create one (free). Then open **Apps → Create app**.
+2. **Auth tab:** set the redirect URL to `http://localhost:8976/callback`
+   (or any free local port — set `HUBSPOT_REDIRECT_PORT` to match). Copy
+   the **Client ID** and **Client Secret**.
+3. **Scopes tab:** select these **read-only** permissions:
 
 | Scope | Purpose |
 |---|---|
+| `oauth` | Required for all OAuth flows |
 | `crm.objects.contacts.read` | Contact data and lifecycle stages |
 | `crm.objects.companies.read` | Company data |
 | `crm.objects.deals.read` | Deal pipeline and revenue data |
@@ -314,13 +336,36 @@ python -m hubspot_revops.cli ask "Show me pipeline by stage"
 | `crm.objects.owners.read` | Sales rep / owner data |
 | `sales-email-read` | Email engagement data |
 
-5. Click **Create app** and copy the access token
-6. Set it: `export HUBSPOT_ACCESS_TOKEN=pat-na1-xxxxxxxx`
+4. Install the app to a HubSpot account (the app's **Install URL** on the
+   Auth tab — this connects the app to your CRM portal so it can be
+   authorized by the OAuth flow).
+5. Export the credentials:
+   ```bash
+   export HUBSPOT_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+   export HUBSPOT_CLIENT_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+   ```
+6. Run any CLI command — e.g. `python -m hubspot_revops.cli schema`. The
+   first run opens your browser, you click **Connect app**, and HubSpot
+   redirects back to `http://localhost:8976/callback`. The skill caches the
+   refresh token and future runs complete silently.
+
+### Advanced: Use a Static Token (CI / Headless)
+
+If you cannot open a browser (CI runners, Docker containers, FlashClaw
+secrets-manager deployments), set `HUBSPOT_ACCESS_TOKEN` to a Private App
+token or a pre-minted OAuth access token. When this variable is set the
+skill skips the interactive OAuth flow entirely.
+
+```bash
+export HUBSPOT_ACCESS_TOKEN=pat-na1-xxxxxxxx
+python -m hubspot_revops.cli schema
+```
 
 ### Security Notes
 
 - **Read-only** — this skill never creates, updates, or deletes CRM data
-- Tokens are passed via environment variables only (never committed to code)
+- Credentials are passed via environment variables only (never committed to code)
+- OAuth tokens are cached under `~/.hubspot_revops/tokens.json` with `0600` permissions
 - Minimum-scope permissions — only what's needed for analytics
 - Rate limit compliant: 100 req/10s (free), 190 req/10s (pro/enterprise), 5 req/s (search)
 
@@ -366,8 +411,8 @@ See [PLAN.md](PLAN.md) for the full implementation plan with API details, data f
 ## Requirements
 
 - Python 3.10+
-- HubSpot account with a Private App (any tier — Free, Starter, Pro, Enterprise)
-- Dependencies: `hubspot-api-client`, `pandas`, `pydantic`, `matplotlib`, `rich`
+- HubSpot developer account with a registered OAuth public app (any tier — Free, Starter, Pro, Enterprise)
+- Dependencies: `hubspot-api-client`, `pandas`, `pydantic`, `matplotlib`, `rich`, `httpx`
 
 ---
 

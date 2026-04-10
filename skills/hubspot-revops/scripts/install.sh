@@ -23,14 +23,23 @@ pip install -e . 2>&1
 # Verify installation
 python3 -c "import hubspot_revops; print(f'hubspot-revops v{hubspot_revops.__version__} installed successfully')"
 
-# Check for token
-if [ -z "$HUBSPOT_ACCESS_TOKEN" ]; then
+# Check for OAuth credentials (or the CI escape-hatch static token)
+if [ -n "$HUBSPOT_ACCESS_TOKEN" ]; then
+    echo "HUBSPOT_ACCESS_TOKEN is set (CI / headless mode — OAuth flow will be skipped)."
+elif [ -n "$HUBSPOT_CLIENT_ID" ] && [ -n "$HUBSPOT_CLIENT_SECRET" ]; then
+    echo "HubSpot OAuth credentials are set. The first run will open a browser to authorize access."
+else
     echo ""
-    echo "WARNING: HUBSPOT_ACCESS_TOKEN is not set."
-    echo "Set it with: export HUBSPOT_ACCESS_TOKEN=pat-na1-xxxxxxxx"
-    echo "Create a Private App at: Settings → Integrations → Private Apps"
+    echo "WARNING: HubSpot credentials are not set."
+    echo "Register a HubSpot public app at: https://developers.hubspot.com"
+    echo "Then export the client ID and secret:"
+    echo "  export HUBSPOT_CLIENT_ID=..."
+    echo "  export HUBSPOT_CLIENT_SECRET=..."
     echo ""
-    echo "Required scopes:"
+    echo "Configure the app's redirect URL to: http://localhost:8976/callback"
+    echo "(Override with HUBSPOT_REDIRECT_PORT if 8976 is unavailable.)"
+    echo ""
+    echo "Required scopes on the app:"
     echo "  - crm.objects.contacts.read"
     echo "  - crm.objects.companies.read"
     echo "  - crm.objects.deals.read"
@@ -38,8 +47,9 @@ if [ -z "$HUBSPOT_ACCESS_TOKEN" ]; then
     echo "  - crm.schemas.custom.read"
     echo "  - crm.objects.owners.read"
     echo "  - sales-email-read"
-else
-    echo "HUBSPOT_ACCESS_TOKEN is set."
+    echo "  - oauth"
+    echo ""
+    echo "(For CI/headless runs, set HUBSPOT_ACCESS_TOKEN instead to skip the OAuth flow.)"
 fi
 
 echo ""
