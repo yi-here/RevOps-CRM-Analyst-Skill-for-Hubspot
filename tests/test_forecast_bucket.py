@@ -80,11 +80,14 @@ def test_bucket_commit_via_contract_sent_and_next_step():
 
 
 def test_bucket_highly_likely_mid_probability():
+    # Use a neutral stage label here — "Proposal" / "Contract" are
+    # explicit Commit triggers under the current rules, so we pick
+    # "Evaluation" to isolate the probability-based path (≥0.5).
     df = pd.DataFrame({
         "id": ["1"],
         "hubspot_owner_id": ["A"],
         "amount": ["5000"],
-        "dealstage": ["proposal"],
+        "dealstage": ["evaluation"],
         "deal_currency_code": ["USD"],
         "pipeline": ["default"],
         "hs_forecast_category": [""],
@@ -96,7 +99,7 @@ def test_bucket_highly_likely_mid_probability():
         pipelines = {"deals": [type("P", (), {
             "pipeline_id": "default",
             "stages": [
-                type("S", (), {"stage_id": "proposal", "label": "Proposal", "probability": 0.6})(),
+                type("S", (), {"stage_id": "evaluation", "label": "Evaluation", "probability": 0.6})(),
             ],
         })()]}
 

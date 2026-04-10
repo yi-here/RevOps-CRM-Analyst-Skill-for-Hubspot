@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.contacts import ContactExtractor
+
+log = logging.getLogger(__name__)
 
 
 LIFECYCLE_STAGES = [
@@ -26,13 +30,32 @@ STAGE_DATE_PROPERTIES = {
 }
 
 
+def _empty_funnel(error: str | None = None) -> dict:
+    """Shape for a funnel payload when contacts search fails or is empty."""
+    payload: dict = {"stages": {}, "conversions": {}, "total_contacts": 0}
+    if error:
+        payload["error"] = error
+    return payload
+
+
 def funnel_conversion_rates(
     contact_extractor: ContactExtractor, time_range: TimeRange
 ) -> dict:
-    """Calculate conversion rates between lifecycle stages."""
-    contacts = contact_extractor.get_new_contacts(time_range)
+    """Calculate conversion rates between lifecycle stages.
+
+    Returns a ``{"error": ...}`` payload rather than raising when the
+    contacts search API is unreachable — the HubSpot contacts endpoint
+    occasionally returns 502s under load and the client's retry policy
+    only covers transient blips, not sustained outages. The funnel report
+    renders a banner instead of crashing the whole command.
+    """
+    try:
+        contacts = contact_extractor.get_new_contacts(time_range)
+    except Exception as exc:
+        log.warning("contacts search failed in funnel_conversion_rates: %s", exc)
+        return _empty_funnel(error=str(exc))
     if contacts.empty:
-        return {"stages": {}, "total_contacts": 0}
+        return _empty_funnel()
 
     stage_counts = {}
     for stage in LIFECYCLE_STAGES:
@@ -68,8 +91,16 @@ def funnel_conversion_rates(
 def lead_source_breakdown(
     contact_extractor: ContactExtractor, time_range: TimeRange
 ) -> pd.DataFrame:
-    """Break down contacts by original traffic source."""
-    contacts = contact_extractor.get_new_contacts(time_range)
+    """Break down contacts by original traffic source.
+
+    Returns an empty DataFrame (rather than raising) if contacts search
+    fails, so a flaky contacts endpoint does not crash the funnel report.
+    """
+    try:
+        contacts = contact_extractor.get_new_contacts(time_range)
+    except Exception as exc:
+        log.warning("contacts search failed in lead_source_breakdown: %s", exc)
+        return pd.DataFrame()
     if contacts.empty:
         return pd.DataFrame()
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
@@ -55,6 +57,20 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
     rev = data["revenue"]
     wt = data["weighted"]
 
+    # Render closed revenue per-currency so the exec summary never
+    # quietly sums ¥ + $ into a misleading "$2.02M". If there is only
+    # one currency the output reads identically to the old single-line
+    # format.
+    by_currency = rev.get("by_currency") or {}
+    if by_currency:
+        revenue_lines = "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats['total_revenue'], code)} "
+            f"({int(stats['deal_count'])} deals)"
+            for code, stats in sorted(by_currency.items())
+        )
+    else:
+        revenue_lines = _fmt_currency(rev.get("total_revenue", 0))
+
     return f"""# Executive Summary
 **Period:** {_period_str(tr)}
 
@@ -69,7 +85,7 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
 ## Performance
 | Metric | Value |
 |---|---|
-| Closed Revenue | {_fmt_currency(rev['total_revenue'])} |
+| Closed Revenue | {revenue_lines} |
 | Deals Won | {wr['won']} |
 | Win Rate | {wr['win_rate']}% |
 | Avg Deal Size (Won) | {_fmt_currency(ads['avg_deal_size'])} |
@@ -84,9 +100,19 @@ def format_pipeline_report(data: dict, tr: TimeRange) -> str:
     vel = data["velocity"]
     cycle = data["cycle"]
 
+    # The open pipeline is a live snapshot — it does NOT respect the
+    # ``--period`` flag. Previously the header said ``Period: Q1-2026``
+    # next to a current snapshot, which led users to interpret the open
+    # pipeline numbers as "pipeline state at Q1 2026 close". That data
+    # does not exist in HubSpot without historical snapshots. Make the
+    # distinction explicit: snapshot header for the open section, period
+    # header only for the time-bound metrics below.
+    snapshot_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         f"# Pipeline Report",
-        f"**Period:** {_period_str(tr)}\n",
+        f"**Open pipeline snapshot:** as of {snapshot_ts} "
+        f"(`--period` does not affect open-deal totals — HubSpot does not "
+        f"expose historical pipeline state)\n",
         f"**Total Open Pipeline:** {_fmt_currency(total['total_value'])} ({total['total_deals']} deals)\n",
     ]
 
@@ -106,7 +132,8 @@ def format_pipeline_report(data: dict, tr: TimeRange) -> str:
             )
 
     lines.extend([
-        f"\n## Key Metrics\n",
+        f"\n## Period Metrics ({_period_str(tr)})\n",
+        "_These metrics use closed deals in the requested period._\n",
         f"- **Win Rate:** {wr['win_rate']}% ({wr['won']}W / {wr['lost']}L)",
         f"- **Avg Sales Cycle:** {cycle['avg_days']:.0f} days (median: {cycle['median_days']:.0f})",
         f"- **Pipeline Velocity:** {_fmt_currency(vel['velocity_per_month'])}/month",
@@ -123,11 +150,28 @@ def format_revenue_report(data: dict, tr: TimeRange) -> str:
         f"# Revenue Report",
         f"**Period:** {_period_str(tr)}\n",
         f"## Closed Revenue\n",
-        f"- **Total:** {_fmt_currency(rev['total_revenue'])}",
-        f"- **Deals:** {rev['deal_count']}",
-        f"- **Avg Deal Size:** {_fmt_currency(rev.get('avg_deal_size', 0))}",
-        f"- **Largest Deal:** {_fmt_currency(rev.get('max_deal', 0))}",
     ]
+
+    by_currency = rev.get("by_currency") or {}
+    if not by_currency:
+        lines.append("_No closed-won revenue in this period._")
+    else:
+        lines.append("| Currency | Revenue | Deals | Avg Size | Largest |")
+        lines.append("|---|---|---|---|---|")
+        for code in sorted(by_currency.keys()):
+            stats = by_currency[code]
+            lines.append(
+                f"| {code} "
+                f"| {_fmt_currency_with_code(stats['total_revenue'], code)} "
+                f"| {int(stats['deal_count'])} "
+                f"| {_fmt_currency_with_code(stats['avg_deal_size'], code)} "
+                f"| {_fmt_currency_with_code(stats['max_deal'], code)} |"
+            )
+        if len(by_currency) > 1:
+            lines.append(
+                "\n> Multi-currency totals are reported separately — JPY and "
+                "USD amounts are never summed."
+            )
 
     if mrr["mrr"] > 0 or mrr["arr"] > 0:
         lines.extend([
@@ -139,14 +183,16 @@ def format_revenue_report(data: dict, tr: TimeRange) -> str:
     by_owner = data["by_owner"]
     if isinstance(by_owner, pd.DataFrame) and not by_owner.empty:
         lines.append("\n## Revenue by Rep\n")
-        lines.append("| Rep | Revenue | Deals | Avg Size |")
-        lines.append("|---|---|---|---|")
+        lines.append("| Rep | Currency | Revenue | Deals | Avg Size |")
+        lines.append("|---|---|---|---|---|")
         for _, row in by_owner.iterrows():
+            code = row.get("currency", "USD")
             lines.append(
                 f"| {row['owner_name']} "
-                f"| {_fmt_currency(row['total_revenue'])} "
+                f"| {code} "
+                f"| {_fmt_currency_with_code(row['total_revenue'], code)} "
                 f"| {int(row['deal_count'])} "
-                f"| {_fmt_currency(row['avg_deal_size'])} |"
+                f"| {_fmt_currency_with_code(row['avg_deal_size'], code)} |"
             )
 
     return "\n".join(lines)
@@ -158,8 +204,19 @@ def format_funnel_report(data: dict, tr: TimeRange) -> str:
     lines = [
         f"# Funnel Report",
         f"**Period:** {_period_str(tr)}\n",
-        f"**Total Contacts:** {funnel['total_contacts']}\n",
     ]
+
+    if funnel.get("error"):
+        lines.append(
+            f"> ⚠️  **Contacts search failed** after retries: {funnel['error']}\n"
+            "> The funnel report could not be generated. This is usually a\n"
+            "> transient HubSpot 5xx — rerun in a minute. If it persists,\n"
+            "> verify the access token has the `crm.objects.contacts.read`\n"
+            "> scope.\n"
+        )
+        return "\n".join(lines)
+
+    lines.append(f"**Total Contacts:** {funnel['total_contacts']}\n")
 
     if funnel.get("stages"):
         lines.append("## Lifecycle Stages\n")
@@ -243,38 +300,71 @@ def format_closed_lost_report(data: dict, tr: TimeRange) -> str:
         )
         lines.append("")
 
+    # Header summary — show lost counts aggregated across all
+    # currencies, and a per-currency value summary (never a mixed
+    # total). ``ghost_deal_count`` and coverage are currency-agnostic.
+    by_currency = data.get("by_currency") or {}
+    lines.append(f"- **Total lost deals:** {total_deals}")
+    if by_currency:
+        value_summary = ", ".join(
+            f"{_fmt_currency_with_code(stats['total_lost_value'], code)} "
+            f"({int(stats['total_lost_deals'])} deals)"
+            for code, stats in sorted(by_currency.items())
+        )
+        lines.append(f"- **Total lost value:** {value_summary}")
     lines.extend([
-        f"- **Total lost deals:** {total_deals}",
-        f"- **Total lost value:** {_fmt_currency(data.get('total_lost_value', 0))}",
         f"- **Ghost deals (zero engagement):** {data.get('ghost_deal_count', 0)}",
         f"- **Lost-reason coverage:** {int(round(coverage * 100))}%",
         "",
     ])
 
-    rep_scorecard = data.get("rep_scorecard")
-    if isinstance(rep_scorecard, pd.DataFrame) and not rep_scorecard.empty:
-        lines.append("## Lost deals by rep\n")
-        lines.append("| Rep | Deals Lost | Lost Value | Avg Lost Deal |")
-        lines.append("|---|---|---|---|")
-        for _, row in rep_scorecard.iterrows():
-            lines.append(
-                f"| {row['rep_name']} "
-                f"| {int(row['deals_lost'])} "
-                f"| {_fmt_currency(row['lost_value'])} "
-                f"| {_fmt_currency(row['avg_lost_deal'])} |"
-            )
+    if len(by_currency) > 1:
+        lines.append(
+            "> Multi-currency losses are reported separately — JPY and "
+            "USD lost values are never summed into a single total.\n"
+        )
 
-    reason_breakdown = data.get("reason_breakdown")
-    if isinstance(reason_breakdown, pd.DataFrame) and not reason_breakdown.empty:
-        lines.append("\n## Reasons\n")
-        lines.append("| Reason | Deals | Value |")
-        lines.append("|---|---|---|")
-        for _, row in reason_breakdown.iterrows():
-            lines.append(
-                f"| {row['closed_lost_reason']} "
-                f"| {int(row['deals_lost'])} "
-                f"| {_fmt_currency(row['lost_value'])} |"
+    # Render per-currency rep scorecard + reason breakdown. For
+    # single-currency portals this renders exactly one section, so the
+    # output shape is unchanged from the previous version.
+    for code in sorted(by_currency.keys()):
+        stats = by_currency[code]
+        currency_header = f"## {code}" if len(by_currency) > 1 else "##"
+        rep_scorecard = stats.get("rep_scorecard")
+        if isinstance(rep_scorecard, pd.DataFrame) and not rep_scorecard.empty:
+            title = (
+                f"{currency_header} Lost deals by rep"
+                if len(by_currency) > 1
+                else "## Lost deals by rep"
             )
+            lines.append(f"{title}\n")
+            lines.append("| Rep | Deals Lost | Lost Value | Avg Lost Deal |")
+            lines.append("|---|---|---|---|")
+            for _, row in rep_scorecard.iterrows():
+                lines.append(
+                    f"| {row['rep_name']} "
+                    f"| {int(row['deals_lost'])} "
+                    f"| {_fmt_currency_with_code(row['lost_value'], code)} "
+                    f"| {_fmt_currency_with_code(row['avg_lost_deal'], code)} |"
+                )
+
+        reason_breakdown = stats.get("reason_breakdown")
+        if isinstance(reason_breakdown, pd.DataFrame) and not reason_breakdown.empty:
+            title = (
+                f"\n{currency_header} Reasons"
+                if len(by_currency) > 1
+                else "\n## Reasons"
+            )
+            lines.append(f"{title}\n")
+            lines.append("| Reason | Deals | Value |")
+            lines.append("|---|---|---|")
+            for _, row in reason_breakdown.iterrows():
+                lines.append(
+                    f"| {row['closed_lost_reason']} "
+                    f"| {int(row['deals_lost'])} "
+                    f"| {_fmt_currency_with_code(row['lost_value'], code)} |"
+                )
+        lines.append("")
 
     return "\n".join(lines)
 
