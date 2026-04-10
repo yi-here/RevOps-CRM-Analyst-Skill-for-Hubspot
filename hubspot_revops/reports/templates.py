@@ -55,6 +55,20 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
     rev = data["revenue"]
     wt = data["weighted"]
 
+    # Render closed revenue per-currency so the exec summary never
+    # quietly sums ¥ + $ into a misleading "$2.02M". If there is only
+    # one currency the output reads identically to the old single-line
+    # format.
+    by_currency = rev.get("by_currency") or {}
+    if by_currency:
+        revenue_lines = "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats['total_revenue'], code)} "
+            f"({int(stats['deal_count'])} deals)"
+            for code, stats in sorted(by_currency.items())
+        )
+    else:
+        revenue_lines = _fmt_currency(rev.get("total_revenue", 0))
+
     return f"""# Executive Summary
 **Period:** {_period_str(tr)}
 
@@ -69,7 +83,7 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
 ## Performance
 | Metric | Value |
 |---|---|
-| Closed Revenue | {_fmt_currency(rev['total_revenue'])} |
+| Closed Revenue | {revenue_lines} |
 | Deals Won | {wr['won']} |
 | Win Rate | {wr['win_rate']}% |
 | Avg Deal Size (Won) | {_fmt_currency(ads['avg_deal_size'])} |
@@ -123,11 +137,28 @@ def format_revenue_report(data: dict, tr: TimeRange) -> str:
         f"# Revenue Report",
         f"**Period:** {_period_str(tr)}\n",
         f"## Closed Revenue\n",
-        f"- **Total:** {_fmt_currency(rev['total_revenue'])}",
-        f"- **Deals:** {rev['deal_count']}",
-        f"- **Avg Deal Size:** {_fmt_currency(rev.get('avg_deal_size', 0))}",
-        f"- **Largest Deal:** {_fmt_currency(rev.get('max_deal', 0))}",
     ]
+
+    by_currency = rev.get("by_currency") or {}
+    if not by_currency:
+        lines.append("_No closed-won revenue in this period._")
+    else:
+        lines.append("| Currency | Revenue | Deals | Avg Size | Largest |")
+        lines.append("|---|---|---|---|---|")
+        for code in sorted(by_currency.keys()):
+            stats = by_currency[code]
+            lines.append(
+                f"| {code} "
+                f"| {_fmt_currency_with_code(stats['total_revenue'], code)} "
+                f"| {int(stats['deal_count'])} "
+                f"| {_fmt_currency_with_code(stats['avg_deal_size'], code)} "
+                f"| {_fmt_currency_with_code(stats['max_deal'], code)} |"
+            )
+        if len(by_currency) > 1:
+            lines.append(
+                "\n> Multi-currency totals are reported separately — JPY and "
+                "USD amounts are never summed."
+            )
 
     if mrr["mrr"] > 0 or mrr["arr"] > 0:
         lines.extend([
@@ -139,14 +170,16 @@ def format_revenue_report(data: dict, tr: TimeRange) -> str:
     by_owner = data["by_owner"]
     if isinstance(by_owner, pd.DataFrame) and not by_owner.empty:
         lines.append("\n## Revenue by Rep\n")
-        lines.append("| Rep | Revenue | Deals | Avg Size |")
-        lines.append("|---|---|---|---|")
+        lines.append("| Rep | Currency | Revenue | Deals | Avg Size |")
+        lines.append("|---|---|---|---|---|")
         for _, row in by_owner.iterrows():
+            code = row.get("currency", "USD")
             lines.append(
                 f"| {row['owner_name']} "
-                f"| {_fmt_currency(row['total_revenue'])} "
+                f"| {code} "
+                f"| {_fmt_currency_with_code(row['total_revenue'], code)} "
                 f"| {int(row['deal_count'])} "
-                f"| {_fmt_currency(row['avg_deal_size'])} |"
+                f"| {_fmt_currency_with_code(row['avg_deal_size'], code)} |"
             )
 
     return "\n".join(lines)
@@ -158,8 +191,19 @@ def format_funnel_report(data: dict, tr: TimeRange) -> str:
     lines = [
         f"# Funnel Report",
         f"**Period:** {_period_str(tr)}\n",
-        f"**Total Contacts:** {funnel['total_contacts']}\n",
     ]
+
+    if funnel.get("error"):
+        lines.append(
+            f"> ⚠️  **Contacts search failed** after retries: {funnel['error']}\n"
+            "> The funnel report could not be generated. This is usually a\n"
+            "> transient HubSpot 5xx — rerun in a minute. If it persists,\n"
+            "> verify the access token has the `crm.objects.contacts.read`\n"
+            "> scope.\n"
+        )
+        return "\n".join(lines)
+
+    lines.append(f"**Total Contacts:** {funnel['total_contacts']}\n")
 
     if funnel.get("stages"):
         lines.append("## Lifecycle Stages\n")

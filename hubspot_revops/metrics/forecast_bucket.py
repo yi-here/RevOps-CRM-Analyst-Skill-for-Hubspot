@@ -3,12 +3,15 @@
 Buckets open deals closing in the current calendar month into three
 categories using the rules from the task:
 
-- **Commit**: stage probability ≥ 0.8, OR HubSpot forecast category is
-  ``"commit"``, OR the stage label contains "contract sent" and
-  ``hs_next_step`` is non-empty (i.e. there is an actionable note).
-- **Highly Likely**: 0.4 ≤ probability < 0.8, OR the deal is in a
-  late-stage bucket with a recently modified ``hs_next_step``.
-- **Best Case**: probability < 0.4.
+- **Commit**: stage probability ≥ 0.8, OR the stage label contains
+  "proposal" or "contract", OR HubSpot forecast category is ``"commit"``.
+- **Highly Likely**: probability ≥ 0.5 (but below the commit threshold).
+- **Best Case**: everything else.
+
+Probabilities are normalised and ``round``\\ ed to two decimal places so
+the comparisons are resilient to HubSpot's noisy string representation
+(e.g. ``"0.80000000000000004"``) — that precision gap used to send every
+late-stage deal into Best Case.
 
 Multi-currency handling: totals are never mixed across currencies.
 """
@@ -34,14 +37,31 @@ def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFr
     return df
 
 
+def _normalize_probability(raw) -> float:
+    """Coerce a HubSpot stage probability to a clean ``[0, 1]`` float.
+
+    HubSpot can return probabilities as floats with 17 decimal places
+    (``"0.80000000000000004"``), as percentage integers (``80``), or as
+    already-normalised fractions (``0.8``). ``round(..., 2)`` snaps the
+    value to two decimal places so ``>= 0.8`` comparisons actually fire
+    for stages that semantically mean "80%".
+    """
+    try:
+        prob = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if prob > 1:
+        prob = prob / 100
+    return round(prob, 2)
+
+
 def _build_probability_map(schema: CRMSchema) -> dict[str, float]:
     """Same pattern as forecast.py: stage_id → probability in [0, 1]."""
     prob_map: dict[str, float] = {}
     for pipelines in schema.pipelines.values():
         for pl in pipelines:
             for s in pl.stages:
-                prob = s.probability / 100 if s.probability > 1 else s.probability
-                prob_map[s.stage_id] = float(prob)
+                prob_map[s.stage_id] = _normalize_probability(s.probability)
     return prob_map
 
 
@@ -67,25 +87,24 @@ def _current_month_range(now: datetime | None = None) -> TimeRange:
 def _assign_bucket(row: pd.Series) -> str:
     prob = row.get("probability", 0.0) or 0.0
     forecast_cat = str(row.get("hs_forecast_category", "") or "").lower()
-    stage_label = str(row.get("stage_label", "") or "")
-    next_step = str(row.get("hs_next_step", "") or "").strip()
+    stage_label = str(row.get("stage_label", "") or "").lower()
 
-    # Commit
+    # Commit: high confidence. Either a ≥0.8 probability, an explicit
+    # HubSpot commit category, or a late-stage label ("proposal" /
+    # "contract") regardless of next-step notes. The previous "needs a
+    # next step" gate was too strict and dumped active deals into Best
+    # Case when reps forgot to write notes.
     if prob >= 0.8:
         return "Commit"
     if forecast_cat == "commit":
         return "Commit"
-    if "contract sent" in stage_label and next_step:
+    if "proposal" in stage_label or "contract" in stage_label:
         return "Commit"
 
-    # Highly Likely
-    if 0.4 <= prob < 0.8:
-        return "Highly Likely"
-    # Late-stage (prob >= 0.5) with an active next step
-    if prob >= 0.5 and next_step:
+    # Highly Likely: ≥0.5 but below the commit threshold.
+    if prob >= 0.5:
         return "Highly Likely"
 
-    # Best case fallback
     return "Best Case"
 
 

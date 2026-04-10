@@ -51,7 +51,15 @@ class HubSpotClient:
                 self.access_token = OAuthFlow.from_env().get_access_token()
             except OAuthError as exc:
                 raise ValueError(str(exc)) from exc
-        retry = Retry(total=3, backoff_factor=0.3, status_forcelist=(429, 500, 502, 504))
+        # Longer backoff (1s, 2s, 4s, 8s, 16s) and one extra attempt give the
+        # contacts search API breathing room on 5xx spikes — the funnel
+        # report used to crash on a single 502.
+        retry = Retry(
+            total=5,
+            backoff_factor=1.0,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "POST"]),
+        )
         self.api = HubSpot(access_token=self.access_token, retry=retry)
         rate_limit = int(os.environ.get("HUBSPOT_RATE_LIMIT", "100"))
         self.rate_limiter = RateLimiter(max_requests=rate_limit)
@@ -117,9 +125,17 @@ class HubSpotClient:
 
     # --- Owners ---
 
-    def get_owners(self, limit: int = 500):
-        """Get all HubSpot owners (max 500 per page)."""
-        return self._rate_limited(self.api.crm.owners.owners_api.get_page, limit=limit)
+    def get_owners(self, limit: int = 500, after: str | None = None):
+        """Get a page of HubSpot owners (max 500 per page).
+
+        Accepts an ``after`` cursor so callers can walk the paginated
+        results; see :func:`hubspot_revops.extractors.owners.get_owners`
+        for the loop that reconciles every page into a single dict.
+        """
+        kwargs: dict = {"limit": limit}
+        if after:
+            kwargs["after"] = after
+        return self._rate_limited(self.api.crm.owners.owners_api.get_page, **kwargs)
 
     # --- Associations ---
 

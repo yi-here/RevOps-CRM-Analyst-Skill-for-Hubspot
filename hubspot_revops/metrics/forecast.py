@@ -6,6 +6,7 @@ import pandas as pd
 
 from hubspot_revops.extractors.deals import DealExtractor
 from hubspot_revops.metrics._utils import to_numeric_series
+from hubspot_revops.metrics.forecast_bucket import _normalize_probability
 from hubspot_revops.schema.models import CRMSchema
 
 
@@ -27,12 +28,16 @@ def weighted_pipeline(
 
     df["amount"] = to_numeric_series(df, "amount")
 
-    # Build stage → probability map
-    prob_map = {}
+    # Build stage → probability map. Share the normalization helper
+    # with forecast_bucket so weighted pipeline and the Commit / Highly
+    # Likely / Best Case bucketing agree on what "80% stage" means —
+    # otherwise executive summary and forecast report disagree because
+    # of a rounding gap.
+    prob_map: dict[str, float] = {}
     for pipelines in schema.pipelines.values():
         for pl in pipelines:
             for s in pl.stages:
-                prob_map[s.stage_id] = s.probability / 100 if s.probability > 1 else s.probability
+                prob_map[s.stage_id] = _normalize_probability(s.probability)
 
     df["probability"] = df["dealstage"].map(prob_map).fillna(0.5)
     df["weighted_amount"] = df["amount"] * df["probability"]

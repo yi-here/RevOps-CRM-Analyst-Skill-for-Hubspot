@@ -107,7 +107,16 @@ def meeting_history(
                 first_meeting_by_deal = valid.groupby("deal_id")["start"].min().to_dict()
 
     closed["closedate_ts"] = pd.to_datetime(closed["closedate"], errors="coerce", utc=True)
-    closed["first_meeting_ts"] = closed["id"].astype(str).map(first_meeting_by_deal)
+    # ``map`` returns NaN (float) for deals with no meeting — mixing NaN
+    # into a Timestamp column breaks the later subtraction with
+    # ``TypeError: unsupported operand``. Coerce through to_datetime so
+    # missing values become NaT, which subtracts cleanly to NaT and
+    # survives ``.dt.total_seconds()``.
+    closed["first_meeting_ts"] = pd.to_datetime(
+        closed["id"].astype(str).map(first_meeting_by_deal),
+        errors="coerce",
+        utc=True,
+    )
     closed["days_first_meeting_to_close"] = (
         (closed["closedate_ts"] - closed["first_meeting_ts"]).dt.total_seconds() / 86400
     )
