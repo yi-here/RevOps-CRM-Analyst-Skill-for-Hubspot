@@ -73,6 +73,50 @@ Revenue Operations teams spend hours pulling data from HubSpot, building spreads
 
 ---
 
+## Why Not Just Use HubSpot's MCP?
+
+HubSpot ships an official MCP server at [`mcp.hubspot.com/anthropic`](https://developers.hubspot.com/mcp). It's genuinely great, and you should probably install it too:
+
+```bash
+claude mcp add --transport http hubspot https://mcp.hubspot.com/anthropic
+```
+
+But MCP alone is a **data access layer** — it gives the model tools to fetch records, then expects the model to compute the numbers inline. That works for exploratory questions. It doesn't work for CFO-grade RevOps reporting. Here's what this skill adds on top:
+
+|  | HubSpot MCP (raw) | This skill |
+|---|---|---|
+| **What it is** | Data access layer — thin wrapper over HubSpot's REST API | Opinionated RevOps analyst — skill + 40+ pandas metric engines + CLI |
+| **Numbers** | Model computes inline from raw records — drifts run-to-run | Deterministic pandas engines — byte-exact every run |
+| **Scale** | Bounded by model context (~2k records practical limit) | Pages + aggregates server-side, handles 20k+ deals |
+| **RevOps heuristics** | None — model re-derives from training each time | Baked in: win-rate n<5 filter, stage-age risk flags, velocity formula, fiscal-quarter parsing |
+| **Report structure** | Varies per query — columns drift between runs | Locked templates — week-over-week comparison works |
+| **Interpretation** | Optional, depends on how the user phrased the question | Mandatory: insights → risks → actions → drill-downs |
+| **Write safety** | Exposes HubSpot's write endpoints — `crm_update_*`, `crm_delete_*` | Architecturally read-only — write code doesn't exist in the package |
+| **Host reach** | Any MCP-compatible host (Claude Code, Cursor, Zed, Desktop) | Claude Code + Python CLI today; MCP wrapper on the roadmap |
+| **Best for** | Freeform queries, cross-tool composition, small portals where exact numbers don't matter | Canned RevOps reports, audit-grade precision, medium-large portals, scheduled "Monday pipeline review" workflows |
+
+### They compose — you can install both
+
+This skill and HubSpot's MCP aren't competitors. MCP is the **transport layer**; this skill is the **opinion layer**. A future version of this skill will ship an MCP wrapper that calls HubSpot's MCP for raw data under the hood and layers the deterministic metric engines + report templates on top. Users who want raw CRM exploration install the HubSpot MCP. Users who want analyst-grade reporting install this skill. Users who want both install both — they don't conflict.
+
+### When to reach for which
+
+**Pick HubSpot's MCP if you're asking things like:**
+- *"Find all companies in California with MRR > $50k whose primary contact matches /VP.*Engineering/"*
+- *"What's this specific deal's associated line items and their product categories?"*
+- *"Compare HubSpot pipeline coverage with the forecast in Salesforce"* (cross-tool queries)
+
+**Pick this skill if you're asking things like:**
+- *"What's our pipeline by stage this quarter?"* (canned report, precise numbers, interpreted)
+- *"Who are the top 5 reps by win rate, excluding reps with fewer than 5 closed deals?"* (RevOps heuristic baked in)
+- *"Give me the executive summary I can show in Monday's leadership meeting"* (locked template, week-over-week comparable)
+- *"My HubSpot portal has 18,000 open deals — what's total pipeline coverage?"* (beyond MCP's context window)
+- *"I need the same pipeline report every Monday at 9am, and the numbers must match the board deck"* (deterministic, auditable)
+
+**The short version:** MCP gives you a HubSpot data hose. This skill gives you a RevOps analyst. Different jobs.
+
+---
+
 ## Use with FlashClaw / OpenClaw
 
 > **[FlashClaw](https://flashlabs.ai)** is the hosted, secure, enterprise-ready version of OpenClaw — built by [FlashLabs.ai](https://flashlabs.ai) for GTM teams that need production-grade AI agents with SOC 2 compliance, SSO, team management, and managed infrastructure. No self-hosting required.
