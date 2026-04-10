@@ -14,7 +14,18 @@ import pytest
 from hubspot_revops.cli import parse_time_range
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.owners import get_owners
-from hubspot_revops.metrics import conversion, forecast_bucket, meeting_history, revenue
+from hubspot_revops.metrics import (
+    closed_lost,
+    conversion,
+    forecast_bucket,
+    meeting_history,
+    revenue,
+    team,
+)
+from hubspot_revops.reports.templates import (
+    format_closed_lost_report,
+    format_pipeline_report,
+)
 from hubspot_revops.schema.models import Owner
 
 
@@ -304,3 +315,187 @@ def test_parse_time_range_month_name_abbrev():
     assert tr.start == datetime(2026, 4, 1)
     # April isn't finished yet; end is capped at now rather than 4/30.
     assert tr.end == now
+
+
+# --- Fix A: Pipeline report header clarifies snapshot vs period -------------
+
+
+def test_pipeline_report_header_shows_snapshot_not_period():
+    """The open-pipeline section must not claim to represent a period
+    — HubSpot does not expose historical pipeline state, so labeling
+    today's open deals as "Q1-2026 pipeline" misled readers."""
+    data = {
+        "total": {"total_deals": 3, "total_value": 60_000.0, "avg_deal_size": 20_000.0},
+        "by_stage": pd.DataFrame(),
+        "win_rate": {"win_rate": 60.0, "won": 3, "lost": 2},
+        "velocity": {"velocity_per_month": 100_000, "avg_cycle_days": 30},
+        "cycle": {"avg_days": 30, "median_days": 28},
+    }
+    tr = TimeRange(start=datetime(2026, 1, 1), end=datetime(2026, 3, 31))
+    out = format_pipeline_report(data, tr)
+
+    # The header must flag the snapshot nature; the period label only
+    # appears next to time-bound metrics.
+    assert "Open pipeline snapshot" in out
+    assert "does not affect open-deal totals" in out
+    assert "Period Metrics" in out
+    # Old label — if this reappears the fix regressed.
+    assert "**Period:** 2026-01-01" not in out
+
+
+# --- Fix B: Closed-lost currency grouping -----------------------------------
+
+
+def test_closed_lost_separates_jpy_and_usd():
+    """A ¥990K Japan-pipeline loss must not inflate USD lost totals."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "hubspot_owner_id": ["A", "A", "B"],
+        "hs_is_closed_won": ["false", "false", "false"],
+        "amount": ["990000", "500", "800"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+        "pipeline": ["japan", "default", "default"],
+        "closed_lost_reason": ["Price", "Price", "Competitor"],
+    })
+    extractor.get_associated_ids.return_value = {"1": ["m"], "2": ["m"], "3": ["m"]}
+
+    owners = {
+        "A": Owner(owner_id="A", first_name="Alice", last_name="Smith"),
+        "B": Owner(owner_id="B", first_name="Bob", last_name="Jones"),
+    }
+    data = closed_lost.closed_lost_analysis(extractor, _tr(), owners)
+
+    by_currency = data["by_currency"]
+    assert set(by_currency.keys()) == {"JPY", "USD"}
+    assert by_currency["JPY"]["total_lost_value"] == 990_000
+    assert by_currency["JPY"]["total_lost_deals"] == 1
+    assert by_currency["USD"]["total_lost_value"] == 1300
+    assert by_currency["USD"]["total_lost_deals"] == 2
+    # Total deal count is currency-agnostic.
+    assert data["total_lost_deals"] == 3
+    # Top-level back-compat value must reflect *primary* currency only
+    # (USD here — more deals), never JPY + USD summed.
+    assert data["primary_currency"] == "USD"
+    assert data["total_lost_value"] == 1300
+
+
+def test_closed_lost_template_renders_per_currency_sections():
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2"],
+        "hubspot_owner_id": ["A", "B"],
+        "hs_is_closed_won": ["false", "false"],
+        "amount": ["990000", "500"],
+        "deal_currency_code": ["JPY", "USD"],
+        "pipeline": ["japan", "default"],
+        "closed_lost_reason": ["Price", "Competitor"],
+    })
+    extractor.get_associated_ids.return_value = {"1": ["m"], "2": ["m"]}
+    owners = {
+        "A": Owner(owner_id="A", first_name="Alice", last_name="Smith"),
+        "B": Owner(owner_id="B", first_name="Bob", last_name="Jones"),
+    }
+    data = closed_lost.closed_lost_analysis(extractor, _tr(), owners)
+    out = format_closed_lost_report(data, _tr())
+
+    # Both currency sections must appear, neither summed.
+    assert "## JPY" in out
+    assert "## USD" in out
+    # Yen symbol rendered, no "$990" USD bleed.
+    assert "¥990.0K" in out or "¥990,000" in out
+    assert "Multi-currency losses are reported separately" in out
+
+
+def test_closed_lost_single_currency_keeps_back_compat_shape():
+    """Single-currency portals must render with the old section headers
+    (no per-currency prefix) to minimise noise."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2"],
+        "hubspot_owner_id": ["A", "B"],
+        "hs_is_closed_won": ["false", "false"],
+        "amount": ["1000", "2000"],
+        "deal_currency_code": ["USD", "USD"],
+        "pipeline": ["default", "default"],
+        "closed_lost_reason": ["Price", "Competitor"],
+    })
+    extractor.get_associated_ids.return_value = {"1": ["m"], "2": ["m"]}
+    owners = {
+        "A": Owner(owner_id="A", first_name="Alice", last_name="Smith"),
+        "B": Owner(owner_id="B", first_name="Bob", last_name="Jones"),
+    }
+    data = closed_lost.closed_lost_analysis(extractor, _tr(), owners)
+    out = format_closed_lost_report(data, _tr())
+
+    assert "## Lost deals by rep" in out
+    assert "## Reasons" in out
+    # No currency prefix sections when only one currency exists.
+    assert "## USD Lost deals" not in out
+
+
+# --- Fix C: Quarter-end boundary includes full last day ---------------------
+
+
+def test_parse_time_range_q1_ends_last_microsecond_of_march_31():
+    tr = parse_time_range("Q1-2026")
+    assert tr.start == datetime(2026, 1, 1)
+    # End is the very last instant of March 31, not midnight (which is
+    # really the start of March 31 and excluded all same-day deals).
+    assert tr.end.year == 2026
+    assert tr.end.month == 3
+    assert tr.end.day == 31
+    assert tr.end.hour == 23
+    assert tr.end.minute == 59
+
+
+def test_parse_time_range_q4_ends_last_microsecond_of_dec_31():
+    tr = parse_time_range("Q4-2026")
+    assert tr.start == datetime(2026, 10, 1)
+    assert tr.end.year == 2026
+    assert tr.end.month == 12
+    assert tr.end.day == 31
+    assert tr.end.hour == 23
+
+
+# --- Team ↔ revenue consistency ---------------------------------------------
+
+
+def test_team_and_revenue_agree_on_won_totals_with_capitalized_boolean():
+    """Regression for the Noah ~$25K discrepancy: HubSpot's SDK can
+    return ``hs_is_closed_won`` as "True" (capitalized) or as Python
+    True — either way the team report's Python filter accepted it, but
+    revenue's ``won_only=True`` API filter (strict string EQ "true")
+    did not. After routing revenue through the same fetch + filter
+    path, the two must agree on every mixed-case variant."""
+    rows = pd.DataFrame({
+        "id": ["1", "2", "3", "4"],
+        "hubspot_owner_id": ["N", "N", "N", "N"],
+        # Mix of lower, upper, title, and Python-bool-as-str forms.
+        "hs_is_closed_won": ["true", "True", "TRUE", "True"],
+        "amount": ["30000", "40000", "50000", "31300"],
+        "deal_currency_code": ["USD", "USD", "USD", "USD"],
+        "pipeline": ["default", "default", "default", "default"],
+        "hs_is_closed": ["true", "true", "true", "true"],
+    })
+
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = rows
+    extractor.get_open_deals.return_value = pd.DataFrame()
+
+    owners = {"N": Owner(owner_id="N", first_name="Noah", last_name="Liam")}
+
+    team_scorecard = team.rep_scorecard(extractor, _tr(), owners)
+    # Reset mock side-effects; both metrics should see the same rows.
+    extractor.get_closed_deals.return_value = rows
+    rev = revenue.closed_revenue(extractor, _tr())
+    extractor.get_closed_deals.return_value = rows
+    rev_by_owner = revenue.revenue_by_owner(extractor, _tr(), owners)
+
+    team_total = float(team_scorecard[team_scorecard["currency"] == "USD"]["closed_won_revenue"].iloc[0])
+    rev_total = float(rev["by_currency"]["USD"]["total_revenue"])
+    rev_by_owner_total = float(
+        rev_by_owner[rev_by_owner["currency"] == "USD"]["total_revenue"].iloc[0]
+    )
+
+    assert team_total == rev_total == rev_by_owner_total == 151_300

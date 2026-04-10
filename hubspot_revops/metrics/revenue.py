@@ -6,7 +6,7 @@ import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import DealExtractor
-from hubspot_revops.metrics._utils import to_numeric_series
+from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
 
 DEFAULT_CURRENCY = "USD"
 
@@ -31,6 +31,34 @@ def _attach_currency(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["currency"] = DEFAULT_CURRENCY
     return df
+
+
+def _fetch_won(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None,
+    properties: list[str] | None = None,
+) -> pd.DataFrame:
+    """Fetch closed deals and filter to wins *in Python*.
+
+    The team scorecard and the revenue metrics must agree on "what
+    counts as a won deal". Previously the team report fetched every
+    closed deal and filtered with ``to_bool_series`` (case-insensitive),
+    while revenue went through the API's ``won_only=True`` path which
+    appends ``hs_is_closed_won EQ "true"`` — a strict string match. For
+    deals whose ``hs_is_closed_won`` is returned by the SDK in any form
+    other than the literal lowercase ``"true"``, the two paths
+    disagreed (team > revenue by ~$25K for at least one rep). Routing
+    both through the same fetch + Python filter eliminates the gap.
+    """
+    closed = _filter_pipeline(
+        deal_extractor.get_closed_deals(time_range, properties=properties),
+        pipeline_filter,
+    )
+    if closed.empty:
+        return closed
+    won_mask = to_bool_series(closed, "hs_is_closed_won")
+    return closed[won_mask].copy()
 
 
 def closed_revenue(
@@ -63,9 +91,7 @@ def closed_revenue(
     caller now sees per-currency subtotals; the back-compat top-level
     fields reflect only the primary (highest-count) currency.
     """
-    won = _filter_pipeline(
-        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
-    )
+    won = _fetch_won(deal_extractor, time_range, pipeline_filter)
     empty_payload = {
         "by_currency": {},
         "primary_currency": DEFAULT_CURRENCY,
@@ -118,9 +144,7 @@ def revenue_by_owner(
     scorecard shape. Aggregating without currency grouping would repeat
     the JPY-in-USD bug at the rep level.
     """
-    won = _filter_pipeline(
-        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
-    )
+    won = _fetch_won(deal_extractor, time_range, pipeline_filter)
     if won.empty:
         return pd.DataFrame()
 
@@ -142,7 +166,7 @@ def revenue_by_owner(
 
 def revenue_by_pipeline(deal_extractor: DealExtractor, time_range: TimeRange) -> pd.DataFrame:
     """Revenue grouped by pipeline."""
-    won = deal_extractor.get_closed_deals(time_range, won_only=True)
+    won = _fetch_won(deal_extractor, time_range, pipeline_filter=None)
     if won.empty:
         return pd.DataFrame()
 
@@ -159,13 +183,20 @@ def mrr_arr_from_deals(
     pipeline_filter: str | None = None,
 ) -> dict:
     """Extract MRR/ARR from deal properties (if populated)."""
-    won = _filter_pipeline(
-        deal_extractor.get_closed_deals(
-            time_range,
-            won_only=True,
-            properties=["amount", "hs_mrr", "hs_arr", "hs_acv", "closedate", "pipeline"],
-        ),
+    won = _fetch_won(
+        deal_extractor,
+        time_range,
         pipeline_filter,
+        properties=[
+            "amount",
+            "hs_mrr",
+            "hs_arr",
+            "hs_acv",
+            "closedate",
+            "pipeline",
+            "hs_is_closed",
+            "hs_is_closed_won",
+        ],
     )
     if won.empty:
         return {"mrr": 0.0, "arr": 0.0}

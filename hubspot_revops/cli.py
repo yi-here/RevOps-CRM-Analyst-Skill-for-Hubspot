@@ -68,10 +68,19 @@ def parse_time_range(period: str | None, *, now: datetime | None = None) -> Time
         start_month = (quarter - 1) * 3 + 1
         start = datetime(year, start_month, 1)
         end_month = start_month + 2
+        # End is the last microsecond of the last day in the quarter.
+        # The previous ``- timedelta(days=1)`` produced ``datetime(y, m,
+        # last_day, 0, 0, 0)`` — i.e. **midnight at the START of the
+        # last day**. Filtering ``closedate LTE`` that value excluded
+        # every deal closed during the last day of the quarter, which
+        # is why the team report for Q1-2026 was missing (or including
+        # adjacent-day) deals depending on timezone drift. Anchor to
+        # the end of the last day instead so every deal that HubSpot
+        # agrees closed "in Q1" is included.
         if end_month == 12:
-            end = datetime(year + 1, 1, 1) - timedelta(days=1)
+            end = datetime(year + 1, 1, 1) - timedelta(microseconds=1)
         else:
-            end = datetime(year, end_month + 1, 1) - timedelta(days=1)
+            end = datetime(year, end_month + 1, 1) - timedelta(microseconds=1)
         return TimeRange(start=start, end=end)
 
     if period.endswith("d"):

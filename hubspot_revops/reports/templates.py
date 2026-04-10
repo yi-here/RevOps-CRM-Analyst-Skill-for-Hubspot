@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
@@ -98,9 +100,19 @@ def format_pipeline_report(data: dict, tr: TimeRange) -> str:
     vel = data["velocity"]
     cycle = data["cycle"]
 
+    # The open pipeline is a live snapshot — it does NOT respect the
+    # ``--period`` flag. Previously the header said ``Period: Q1-2026``
+    # next to a current snapshot, which led users to interpret the open
+    # pipeline numbers as "pipeline state at Q1 2026 close". That data
+    # does not exist in HubSpot without historical snapshots. Make the
+    # distinction explicit: snapshot header for the open section, period
+    # header only for the time-bound metrics below.
+    snapshot_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     lines = [
         f"# Pipeline Report",
-        f"**Period:** {_period_str(tr)}\n",
+        f"**Open pipeline snapshot:** as of {snapshot_ts} "
+        f"(`--period` does not affect open-deal totals — HubSpot does not "
+        f"expose historical pipeline state)\n",
         f"**Total Open Pipeline:** {_fmt_currency(total['total_value'])} ({total['total_deals']} deals)\n",
     ]
 
@@ -120,7 +132,8 @@ def format_pipeline_report(data: dict, tr: TimeRange) -> str:
             )
 
     lines.extend([
-        f"\n## Key Metrics\n",
+        f"\n## Period Metrics ({_period_str(tr)})\n",
+        "_These metrics use closed deals in the requested period._\n",
         f"- **Win Rate:** {wr['win_rate']}% ({wr['won']}W / {wr['lost']}L)",
         f"- **Avg Sales Cycle:** {cycle['avg_days']:.0f} days (median: {cycle['median_days']:.0f})",
         f"- **Pipeline Velocity:** {_fmt_currency(vel['velocity_per_month'])}/month",
@@ -287,38 +300,71 @@ def format_closed_lost_report(data: dict, tr: TimeRange) -> str:
         )
         lines.append("")
 
+    # Header summary — show lost counts aggregated across all
+    # currencies, and a per-currency value summary (never a mixed
+    # total). ``ghost_deal_count`` and coverage are currency-agnostic.
+    by_currency = data.get("by_currency") or {}
+    lines.append(f"- **Total lost deals:** {total_deals}")
+    if by_currency:
+        value_summary = ", ".join(
+            f"{_fmt_currency_with_code(stats['total_lost_value'], code)} "
+            f"({int(stats['total_lost_deals'])} deals)"
+            for code, stats in sorted(by_currency.items())
+        )
+        lines.append(f"- **Total lost value:** {value_summary}")
     lines.extend([
-        f"- **Total lost deals:** {total_deals}",
-        f"- **Total lost value:** {_fmt_currency(data.get('total_lost_value', 0))}",
         f"- **Ghost deals (zero engagement):** {data.get('ghost_deal_count', 0)}",
         f"- **Lost-reason coverage:** {int(round(coverage * 100))}%",
         "",
     ])
 
-    rep_scorecard = data.get("rep_scorecard")
-    if isinstance(rep_scorecard, pd.DataFrame) and not rep_scorecard.empty:
-        lines.append("## Lost deals by rep\n")
-        lines.append("| Rep | Deals Lost | Lost Value | Avg Lost Deal |")
-        lines.append("|---|---|---|---|")
-        for _, row in rep_scorecard.iterrows():
-            lines.append(
-                f"| {row['rep_name']} "
-                f"| {int(row['deals_lost'])} "
-                f"| {_fmt_currency(row['lost_value'])} "
-                f"| {_fmt_currency(row['avg_lost_deal'])} |"
-            )
+    if len(by_currency) > 1:
+        lines.append(
+            "> Multi-currency losses are reported separately — JPY and "
+            "USD lost values are never summed into a single total.\n"
+        )
 
-    reason_breakdown = data.get("reason_breakdown")
-    if isinstance(reason_breakdown, pd.DataFrame) and not reason_breakdown.empty:
-        lines.append("\n## Reasons\n")
-        lines.append("| Reason | Deals | Value |")
-        lines.append("|---|---|---|")
-        for _, row in reason_breakdown.iterrows():
-            lines.append(
-                f"| {row['closed_lost_reason']} "
-                f"| {int(row['deals_lost'])} "
-                f"| {_fmt_currency(row['lost_value'])} |"
+    # Render per-currency rep scorecard + reason breakdown. For
+    # single-currency portals this renders exactly one section, so the
+    # output shape is unchanged from the previous version.
+    for code in sorted(by_currency.keys()):
+        stats = by_currency[code]
+        currency_header = f"## {code}" if len(by_currency) > 1 else "##"
+        rep_scorecard = stats.get("rep_scorecard")
+        if isinstance(rep_scorecard, pd.DataFrame) and not rep_scorecard.empty:
+            title = (
+                f"{currency_header} Lost deals by rep"
+                if len(by_currency) > 1
+                else "## Lost deals by rep"
             )
+            lines.append(f"{title}\n")
+            lines.append("| Rep | Deals Lost | Lost Value | Avg Lost Deal |")
+            lines.append("|---|---|---|---|")
+            for _, row in rep_scorecard.iterrows():
+                lines.append(
+                    f"| {row['rep_name']} "
+                    f"| {int(row['deals_lost'])} "
+                    f"| {_fmt_currency_with_code(row['lost_value'], code)} "
+                    f"| {_fmt_currency_with_code(row['avg_lost_deal'], code)} |"
+                )
+
+        reason_breakdown = stats.get("reason_breakdown")
+        if isinstance(reason_breakdown, pd.DataFrame) and not reason_breakdown.empty:
+            title = (
+                f"\n{currency_header} Reasons"
+                if len(by_currency) > 1
+                else "\n## Reasons"
+            )
+            lines.append(f"{title}\n")
+            lines.append("| Reason | Deals | Value |")
+            lines.append("|---|---|---|")
+            for _, row in reason_breakdown.iterrows():
+                lines.append(
+                    f"| {row['closed_lost_reason']} "
+                    f"| {int(row['deals_lost'])} "
+                    f"| {_fmt_currency_with_code(row['lost_value'], code)} |"
+                )
+        lines.append("")
 
     return "\n".join(lines)
 
