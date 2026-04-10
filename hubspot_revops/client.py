@@ -38,12 +38,19 @@ class HubSpotClient:
     """Wrapper around the HubSpot Python SDK with rate limiting and convenience methods."""
 
     def __init__(self, access_token: str | None = None) -> None:
-        self.access_token = access_token or os.environ.get("HUBSPOT_ACCESS_TOKEN", "")
-        if not self.access_token:
-            raise ValueError(
-                "HUBSPOT_ACCESS_TOKEN is required. "
-                "Set it as an environment variable or pass it to HubSpotClient()."
-            )
+        if access_token:
+            self.access_token = access_token
+        elif os.environ.get("HUBSPOT_ACCESS_TOKEN"):
+            # CI / headless escape hatch — use a static token directly.
+            self.access_token = os.environ["HUBSPOT_ACCESS_TOKEN"]
+        else:
+            # Interactive OAuth 2.0 flow against a user-registered public app.
+            from hubspot_revops.auth import OAuthError, OAuthFlow
+
+            try:
+                self.access_token = OAuthFlow.from_env().get_access_token()
+            except OAuthError as exc:
+                raise ValueError(str(exc)) from exc
         retry = Retry(total=3, backoff_factor=0.3, status_forcelist=(429, 500, 502, 504))
         self.api = HubSpot(access_token=self.access_token, retry=retry)
         rate_limit = int(os.environ.get("HUBSPOT_RATE_LIMIT", "100"))

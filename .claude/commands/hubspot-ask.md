@@ -13,7 +13,7 @@ Answer a natural-language RevOps question using live HubSpot CRM data.
 
 ## Steps
 
-1. Ensure `HUBSPOT_ACCESS_TOKEN` is set. If not, ask the user.
+1. Ensure `HUBSPOT_CLIENT_ID` and `HUBSPOT_CLIENT_SECRET` are set (from a HubSpot public app registered at https://developers.hubspot.com). The first run will open a browser to complete authorization; subsequent runs use the cached refresh token. If the variables are missing, ask the user. For CI/headless, `HUBSPOT_ACCESS_TOKEN` can be set instead to skip the OAuth flow.
 2. Run the question through the NL interface:
 
 ```bash

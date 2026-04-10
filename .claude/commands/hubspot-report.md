@@ -22,7 +22,7 @@ Generate a RevOps analytics report from HubSpot CRM data.
 
 ## Steps
 
-1. Ensure `HUBSPOT_ACCESS_TOKEN` is set. If not, ask the user.
+1. Ensure `HUBSPOT_CLIENT_ID` and `HUBSPOT_CLIENT_SECRET` are set (from a HubSpot public app registered at https://developers.hubspot.com). The first run will open a browser to complete authorization; subsequent runs use the cached refresh token. If the variables are missing, ask the user. For CI/headless, `HUBSPOT_ACCESS_TOKEN` can be set instead to skip the OAuth flow.
 2. Parse the report type from `$ARGUMENTS`. Default to `executive` if unclear.
 3. Parse the time period if provided (e.g., `Q1-2026`, `90d`, `6m`). Default to last 90 days.
 4. Run the report:

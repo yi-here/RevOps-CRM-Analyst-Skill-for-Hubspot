@@ -10,9 +10,17 @@ Connects to a HubSpot CRM instance and answers RevOps business questions by:
 
 ## Setup
 
-1. Set `HUBSPOT_ACCESS_TOKEN` in your environment (Private App token)
-2. Run `pip install -e .` from the project root
-3. The skill auto-discovers your HubSpot schema on first run
+1. Register a HubSpot public app at https://developers.hubspot.com. Set its
+   redirect URL to `http://localhost:8976/callback` and enable the read
+   scopes listed in `README.md`.
+2. Set `HUBSPOT_CLIENT_ID` and `HUBSPOT_CLIENT_SECRET` in your environment.
+3. Run `pip install -e .` from the project root.
+4. On first run, a browser opens to complete HubSpot authorization. Tokens
+   are cached under `~/.hubspot_revops/tokens.json` and refreshed silently.
+5. The skill auto-discovers your HubSpot schema on first run.
+
+For CI or headless environments, set `HUBSPOT_ACCESS_TOKEN` instead (Private
+App token or pre-minted OAuth token) to skip the interactive flow entirely.
 
 ## Architecture
 
