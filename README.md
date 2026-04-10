@@ -267,6 +267,11 @@ claude
 # Install
 pip install -e .
 
+# (Recommended) Install HubSpot's official MCP server as the companion
+# data-access layer. This skill handles canned reports; the MCP handles
+# ad-hoc record lookups. They compose.
+claude mcp add --transport http hubspot https://mcp.hubspot.com/anthropic
+
 # Set your HubSpot OAuth app credentials
 # (Register a public app at https://developers.hubspot.com — see HubSpot Setup below)
 export HUBSPOT_CLIENT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx

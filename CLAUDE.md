@@ -30,6 +30,9 @@ App token or pre-minted OAuth token) to skip the interactive flow entirely.
 - `hubspot_revops/metrics/` — Metric computation engines
 - `hubspot_revops/reports/` — Report generation (markdown, CSV, charts)
 - `hubspot_revops/nl_interface.py` — Natural language → metric routing
+- HubSpot's official MCP server (`https://mcp.hubspot.com/anthropic`) is the
+  recommended companion for ad-hoc record lookups; this skill owns the
+  aggregated RevOps metrics. Install with `claude mcp add --transport http hubspot https://mcp.hubspot.com/anthropic`.
 
 ## Key Commands
 
