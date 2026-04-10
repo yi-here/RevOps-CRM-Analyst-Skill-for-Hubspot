@@ -24,7 +24,11 @@ import pandas as pd
 from hubspot_revops.extractors.activities import ActivityExtractor
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import DealExtractor
-from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
+from hubspot_revops.metrics._utils import (
+    parse_hs_datetime,
+    to_bool_series,
+    to_numeric_series,
+)
 from hubspot_revops.schema.models import Owner
 
 
@@ -92,9 +96,14 @@ def meeting_history(
     first_meeting_by_deal: dict[str, pd.Timestamp] = {}
     if not meetings_df.empty and "hs_meeting_start_time" in meetings_df.columns:
         meetings_df = meetings_df.copy()
-        meetings_df["start"] = pd.to_datetime(
-            meetings_df["hs_meeting_start_time"], errors="coerce", utc=True
-        )
+        # ``hs_meeting_start_time`` is returned as an epoch-ms string
+        # (e.g. "1712345678000"). The previous ``pd.to_datetime(...,
+        # utc=True)`` call silently parsed those as year 1712345678 and
+        # returned NaT for every row, which is why "median days first
+        # meeting → close" was stuck at 0.0 for both won and lost. Route
+        # through ``parse_hs_datetime`` which tries epoch-ms first and
+        # falls back to ISO parsing.
+        meetings_df["start"] = parse_hs_datetime(meetings_df["hs_meeting_start_time"])
         # Invert deal_to_meetings: meeting_id → deal_id
         meeting_to_deal: dict[str, str] = {}
         for d, mids in deal_to_meetings.items():
@@ -106,7 +115,9 @@ def meeting_history(
             if not valid.empty:
                 first_meeting_by_deal = valid.groupby("deal_id")["start"].min().to_dict()
 
-    closed["closedate_ts"] = pd.to_datetime(closed["closedate"], errors="coerce", utc=True)
+    # closedate from the deals search is usually an ISO date, but we
+    # route it through the same helper so either format works.
+    closed["closedate_ts"] = parse_hs_datetime(closed["closedate"])
     # ``map`` returns NaN (float) for deals with no meeting — mixing NaN
     # into a Timestamp column breaks the later subtraction with
     # ``TypeError: unsupported operand``. Coerce through to_datetime so

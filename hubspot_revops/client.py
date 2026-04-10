@@ -92,7 +92,24 @@ class HubSpotClient:
         limit: int = 200,
         after: str | None = None,
     ):
-        """Search CRM objects with filters. Max 200 per page, 10K total per query."""
+        """Search CRM objects with filters. Max 200 per page, 10K total per query.
+
+        Two SDK shapes must be supported for engagements (calls / emails
+        / meetings / notes / tasks):
+
+        1. **Dedicated sub-module** (e.g. ``self.api.crm.objects.calls``):
+           call ``search_api.do_search(public_object_search_request=...)``.
+           This is the preferred path when the SDK exposes the
+           engagement type as its own module — no positional arg.
+        2. **Generic objects API** (``self.api.crm.objects``): call
+           ``search_api.do_search(object_type, public_object_search_request=...)``.
+           This is the fallback when no dedicated sub-module exists.
+           The generic entrypoint **requires** ``object_type`` as a
+           positional argument — the newer SDK versions enforce it,
+           which is why the activity report was crashing with
+           ``do_search() missing 1 required positional argument:
+           'object_type'`` and returning 0 for every engagement type.
+        """
         request = PublicObjectSearchRequest(
             filter_groups=filter_groups,
             properties=properties or [],
@@ -100,10 +117,32 @@ class HubSpotClient:
             limit=min(limit, 200),
             after=after or "0",
         )
-        search_api = getattr(self.api.crm, _sdk_module(object_type), self.api.crm.objects)
-        # Search API has its own 5 req/sec rate limit
+        # 1. Prefer a top-level module (deals, contacts, companies, …).
+        top_level = getattr(self.api.crm, _sdk_module(object_type), None)
+        # 2. If that was the generic fallback *or* didn't exist, try a
+        #    sub-module on ``crm.objects`` for engagements.
+        nested = getattr(self.api.crm.objects, object_type, None)
+
         self.search_rate_limiter.wait_if_needed()
-        return self._rate_limited(search_api.search_api.do_search, public_object_search_request=request)
+
+        if top_level is not None and _sdk_module(object_type) != "objects":
+            # Dedicated top-level module — object_type is implicit.
+            return self._rate_limited(
+                top_level.search_api.do_search,
+                public_object_search_request=request,
+            )
+        if nested is not None and hasattr(nested, "search_api"):
+            # Engagement sub-module (e.g. crm.objects.meetings).
+            return self._rate_limited(
+                nested.search_api.do_search,
+                public_object_search_request=request,
+            )
+        # Generic objects API — object_type MUST be passed positionally.
+        return self._rate_limited(
+            self.api.crm.objects.search_api.do_search,
+            object_type,
+            public_object_search_request=request,
+        )
 
     # --- Properties / Schema ---
 

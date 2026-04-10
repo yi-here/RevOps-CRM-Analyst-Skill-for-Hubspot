@@ -19,11 +19,15 @@ from hubspot_revops.metrics import (
     conversion,
     forecast_bucket,
     meeting_history,
+    pipeline,
     revenue,
     team,
 )
+from hubspot_revops.metrics._utils import parse_hs_datetime, pick_primary_currency
 from hubspot_revops.reports.templates import (
     format_closed_lost_report,
+    format_executive_summary,
+    format_funnel_report,
     format_pipeline_report,
 )
 from hubspot_revops.schema.models import Owner
@@ -459,6 +463,392 @@ def test_parse_time_range_q4_ends_last_microsecond_of_dec_31():
 
 
 # --- Team ↔ revenue consistency ---------------------------------------------
+
+
+# --- Pipeline total currency mixing (third verification pass) --------------
+
+
+def _pipeline_schema():
+    """Minimal CRMSchema-ish object for pipeline_by_stage tests."""
+    class FakeStage:
+        def __init__(self, stage_id, label):
+            self.stage_id = stage_id
+            self.label = label
+            self.probability = 0.5
+
+    class FakePipeline:
+        def __init__(self, pipeline_id, label, stages):
+            self.pipeline_id = pipeline_id
+            self.label = label
+            self.stages = stages
+
+    class FakeSchema:
+        pipelines = {
+            "deals": [
+                FakePipeline("default", "Sales", [FakeStage("qualified", "Qualified")]),
+                FakePipeline("japan", "Japan", [FakeStage("jp_qualified", "Qualified")]),
+            ]
+        }
+
+    return FakeSchema()
+
+
+def test_total_pipeline_value_groups_by_currency():
+    """The Pipeline Report's $129.06M = ¥118M + $11M bug: open pipeline
+    totals must never sum across currencies. This exercises the open
+    side directly (the revenue bug-fix tests cover the closed side)."""
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["118000000", "5000000", "6000000"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+        "pipeline": ["japan", "default", "default"],
+        "dealstage": ["jp_qualified", "qualified", "qualified"],
+    })
+
+    result = pipeline.total_pipeline_value(extractor)
+    by_currency = result["by_currency"]
+    assert set(by_currency.keys()) == {"JPY", "USD"}
+    assert by_currency["JPY"]["total_value"] == 118_000_000
+    assert by_currency["USD"]["total_value"] == 11_000_000
+    # Primary is USD (2 deals vs 1); back-compat top-level reflects USD.
+    assert result["primary_currency"] == "USD"
+    assert result["total_value"] == 11_000_000
+    # Deal count is universal — 3 open deals total.
+    assert result["total_deals"] == 3
+
+
+def test_pipeline_by_stage_splits_currencies_within_same_stage():
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2"],
+        "amount": ["1000000", "50000"],
+        "deal_currency_code": ["JPY", "USD"],
+        "pipeline": ["japan", "default"],
+        "dealstage": ["jp_qualified", "qualified"],
+    })
+    df = pipeline.pipeline_by_stage(extractor, _pipeline_schema())
+    assert "currency" in df.columns
+    assert set(df["currency"]) == {"JPY", "USD"}
+    jpy = df[df["currency"] == "JPY"].iloc[0]
+    usd = df[df["currency"] == "USD"].iloc[0]
+    assert jpy["total_value"] == 1_000_000
+    assert usd["total_value"] == 50_000
+
+
+def test_avg_deal_size_groups_by_currency():
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["1000000", "50000", "30000"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+        "pipeline": ["japan", "default", "default"],
+        "hs_is_closed_won": ["true", "true", "true"],
+    })
+    result = pipeline.avg_deal_size(extractor, _tr())
+    by_currency = result["by_currency"]
+    assert by_currency["JPY"]["avg_deal_size"] == 1_000_000
+    assert by_currency["USD"]["avg_deal_size"] == 40_000
+    assert result["primary_currency"] == "USD"
+    # Top-level avg_deal_size is PRIMARY ONLY, not a cross-currency avg.
+    assert result["avg_deal_size"] == 40_000
+
+
+def test_pipeline_velocity_uses_primary_currency_only():
+    """Velocity must be denominated in a single currency — mixing a
+    JPY avg_size with a USD open-deal count produces a nonsense number."""
+    extractor = MagicMock()
+    # 2 USD open deals, 1 JPY open.
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["100000", "200000", "5000000"],
+        "deal_currency_code": ["USD", "USD", "JPY"],
+        "pipeline": ["default", "default", "japan"],
+        "dealstage": ["qualified", "qualified", "jp_qualified"],
+    })
+    # Won deals: 1 USD @ $50K avg, 1 JPY @ ¥1M avg.
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["w1", "w2"],
+        "amount": ["50000", "1000000"],
+        "deal_currency_code": ["USD", "JPY"],
+        "pipeline": ["default", "japan"],
+        "hs_is_closed_won": ["true", "true"],
+        "closedate": ["2026-03-15T00:00:00Z", "2026-03-15T00:00:00Z"],
+        "createdate": ["2026-01-15T00:00:00Z", "2026-01-15T00:00:00Z"],
+    })
+
+    vel = pipeline.pipeline_velocity(extractor, _tr())
+    # Primary currency is USD (2 open deals vs 1 JPY).
+    assert vel["currency"] == "USD"
+    # open_deals in velocity must be the USD-only count, not the total.
+    assert vel["open_deals"] == 2
+    # avg_deal_size is pulled from the USD bucket of won deals.
+    assert vel["avg_deal_size"] == 50_000
+
+
+def test_pipeline_report_template_renders_per_currency_totals():
+    total = pipeline.total_pipeline_value(MagicMock(
+        **{"get_open_deals.return_value": pd.DataFrame({
+            "id": ["1", "2", "3"],
+            "amount": ["118000000", "5000000", "6000000"],
+            "deal_currency_code": ["JPY", "USD", "USD"],
+            "pipeline": ["japan", "default", "default"],
+            "dealstage": ["jp_qualified", "qualified", "qualified"],
+        })}
+    ))
+    data = {
+        "total": total,
+        "by_stage": pd.DataFrame(),
+        "win_rate": {"win_rate": 50.0, "won": 1, "lost": 1},
+        "velocity": {"velocity_per_month": 100_000, "avg_cycle_days": 30, "currency": "USD"},
+        "cycle": {"avg_days": 30, "median_days": 28},
+    }
+    out = format_pipeline_report(data, _tr())
+    # Both currency lines present, no mixed sum.
+    assert "JPY" in out
+    assert "USD" in out
+    # The old "$129.06M" bug would show the sum; ensure it doesn't.
+    assert "$129" not in out
+    assert "Multi-currency totals are reported separately" in out
+
+
+def test_executive_summary_template_renders_multi_currency_pipeline():
+    """The exec summary's Open Pipeline line must not be a single
+    mixed total. Each currency gets its own sub-line inside the cell."""
+    data = {
+        "pipeline": {
+            "by_currency": {
+                "JPY": {"deal_count": 1, "total_value": 118_000_000, "avg_deal_size": 118_000_000},
+                "USD": {"deal_count": 2, "total_value": 11_000_000, "avg_deal_size": 5_500_000},
+            },
+            "primary_currency": "USD",
+            "total_deals": 3,
+            "total_value": 11_000_000,
+            "avg_deal_size": 5_500_000,
+        },
+        "win_rate": {"win_rate": 50.0, "won": 1, "lost": 1},
+        "avg_deal_size": {
+            "by_currency": {
+                "USD": {"deal_count": 1, "avg_deal_size": 50_000, "total_revenue": 50_000},
+            },
+            "primary_currency": "USD",
+            "avg_deal_size": 50_000,
+            "total_revenue": 50_000,
+            "deal_count": 1,
+        },
+        "velocity": {"velocity_per_month": 100_000, "avg_cycle_days": 30, "currency": "USD"},
+        "revenue": {
+            "by_currency": {"USD": {"total_revenue": 50_000, "deal_count": 1}},
+            "primary_currency": "USD",
+            "total_revenue": 50_000,
+            "deal_count": 1,
+            "total_deals": 1,
+        },
+        "weighted": {"weighted_value": 60_000, "unweighted_value": 100_000, "deal_count": 3},
+    }
+    out = format_executive_summary(data, _tr())
+    # Per-currency lines rendered inside the Open Pipeline cell.
+    assert "JPY:" in out
+    assert "USD:" in out
+    assert "¥118.00M" in out
+    # No silent $129M sum.
+    assert "$129" not in out
+
+
+# --- Funnel contact total truncation ----------------------------------------
+
+
+def test_funnel_uses_server_reported_total_for_top_of_funnel():
+    """A portal with 7.1M contacts must not display "10,000" as the
+    top of the funnel. The Search API caps pagination at 10K but reports
+    the true total via ``response.total``; we use that for display."""
+    extractor = MagicMock()
+    # The paginated fetch returns the 10K-row sample.
+    sample = pd.DataFrame({
+        "id": [str(i) for i in range(10_000)],
+        "createdate": ["2026-03-01"] * 10_000,
+        "hs_lifecyclestage_customer_date": [None] * 10_000,
+    })
+    sample.attrs["hs_total"] = 7_157_756
+    extractor.get_new_contacts.return_value = sample
+    extractor.count_via_search.return_value = 7_157_756
+
+    result = conversion.funnel_conversion_rates(extractor, _tr())
+    # The top-of-funnel reflects the server total, not the truncated sample.
+    assert result["total_contacts"] == 7_157_756
+    assert result["sampled_contacts"] == 10_000
+    assert result["truncated"] is True
+    # Subscriber stage count also matches the true total.
+    assert result["stages"]["subscriber"] == 7_157_756
+
+
+def test_funnel_template_renders_truncation_warning():
+    data = {
+        "funnel": {
+            "stages": {"subscriber": 7_157_756, "lead": 100},
+            "conversions": {},
+            "total_contacts": 7_157_756,
+            "sampled_contacts": 10_000,
+            "truncated": True,
+        },
+        "sources": pd.DataFrame(),
+    }
+    out = format_funnel_report(data, _tr())
+    assert "7,157,756" in out
+    assert "10,000" in out
+    assert "Sampled breakdown" in out
+
+
+# --- Activity SDK do_search object_type argument ----------------------------
+
+
+def test_search_objects_passes_object_type_positionally_for_generic_api():
+    """Regression for "SearchApi.do_search() missing 1 required positional
+    argument: 'object_type'". Engagement types (calls, emails, meetings,
+    notes, tasks) fall back to the generic ``crm.objects.search_api``
+    which requires ``object_type`` as a positional argument."""
+    from hubspot_revops.client import HubSpotClient
+
+    client = HubSpotClient.__new__(HubSpotClient)
+
+    # Stand up a minimal fake SDK: top-level ``crm.objects.search_api``
+    # exists but no dedicated ``crm.meetings`` module and no nested
+    # ``crm.objects.meetings``. The call must go through the generic
+    # path with ``object_type`` positional.
+    calls = []
+
+    class FakeSearchApi:
+        def do_search(self, *args, **kwargs):
+            calls.append({"args": args, "kwargs": kwargs})
+            return SimpleNamespace(results=[], paging=None, total=0)
+
+    class FakeObjectsApi:
+        search_api = FakeSearchApi()
+
+    class FakeCrm:
+        objects = FakeObjectsApi()
+
+    client.api = SimpleNamespace(crm=FakeCrm())
+
+    class FakeLimiter:
+        def wait_if_needed(self):
+            pass
+
+    client.rate_limiter = FakeLimiter()
+    client.search_rate_limiter = FakeLimiter()
+
+    def _rate_limited(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    client._rate_limited = _rate_limited
+
+    client.search_objects(
+        object_type="calls",
+        filter_groups=[{"filters": []}],
+    )
+
+    assert len(calls) == 1
+    # "calls" must have been passed as the first positional arg to the
+    # generic objects search API.
+    assert calls[0]["args"][0] == "calls"
+    assert "public_object_search_request" in calls[0]["kwargs"]
+
+
+# --- Meeting timestamp parsing (timezone / epoch-ms) ------------------------
+
+
+def test_parse_hs_datetime_handles_epoch_ms_strings():
+    """hs_meeting_start_time comes back as epoch-ms strings like
+    "1712345678000". The old ``pd.to_datetime(..., utc=True)`` path
+    parsed those as year 1712345678 and returned NaT, which is why
+    'Median days first meeting → close' was stuck at 0.0."""
+    # 2026-04-01 00:00:00 UTC as epoch ms.
+    epoch_ms = str(int(datetime(2026, 4, 1).timestamp() * 1000))
+    series = pd.Series([epoch_ms, "", None])
+    parsed = parse_hs_datetime(series)
+    assert parsed.iloc[0].year == 2026
+    assert parsed.iloc[0].month == 4
+    assert pd.isna(parsed.iloc[1])
+    assert pd.isna(parsed.iloc[2])
+
+
+def test_parse_hs_datetime_handles_iso_strings():
+    series = pd.Series(["2026-04-01T12:30:00Z", "2026-03-15"])
+    parsed = parse_hs_datetime(series)
+    assert parsed.iloc[0].year == 2026
+    assert parsed.iloc[0].month == 4
+    assert parsed.iloc[1].year == 2026
+    assert parsed.iloc[1].month == 3
+
+
+def test_meeting_history_median_nonzero_with_epoch_ms_meetings():
+    """End-to-end regression for the 0.0 median bug: feed epoch-ms
+    hs_meeting_start_time values and assert the median days-to-close
+    is the real value, not 0."""
+    deal_extractor = MagicMock()
+    deal_extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1"],
+        "dealname": ["Alpha"],
+        "hubspot_owner_id": ["A"],
+        "hs_is_closed_won": ["true"],
+        "amount": ["10000"],
+        "pipeline": ["default"],
+        # closedate as ISO for variety.
+        "closedate": ["2026-04-15T00:00:00Z"],
+    })
+    deal_extractor.get_associated_ids.return_value = {"1": ["m1"]}
+
+    activity_extractor = MagicMock()
+    meeting_epoch_ms = str(int(datetime(2026, 4, 1).timestamp() * 1000))
+    activity_extractor.get_activities.return_value = pd.DataFrame({
+        "id": ["m1"],
+        "hs_meeting_start_time": [meeting_epoch_ms],
+    })
+
+    owners = {"A": Owner(owner_id="A", first_name="Alice", last_name="Smith")}
+    data = meeting_history.meeting_history(
+        deal_extractor, activity_extractor, _tr(), owners=owners
+    )
+    # 14 days between April 1 and April 15.
+    assert data["time_to_close"]["median_days_won"] == pytest.approx(14.0, abs=0.1)
+
+
+# --- pick_primary_currency helper -------------------------------------------
+
+
+def test_pick_primary_currency_picks_highest_count():
+    assert (
+        pick_primary_currency({
+            "JPY": {"deal_count": 1},
+            "USD": {"deal_count": 5},
+        })
+        == "USD"
+    )
+
+
+def test_pick_primary_currency_ties_break_alphabetically_later():
+    """Matches the existing revenue/closed_lost behaviour: on a tie,
+    lexicographically later code wins ("USD" > "JPY")."""
+    assert (
+        pick_primary_currency({
+            "JPY": {"deal_count": 5},
+            "USD": {"deal_count": 5},
+        })
+        == "USD"
+    )
+
+
+def test_pick_primary_currency_custom_count_key():
+    assert (
+        pick_primary_currency(
+            {
+                "JPY": {"total_lost_deals": 10},
+                "USD": {"total_lost_deals": 3},
+            },
+            count_key="total_lost_deals",
+        )
+        == "JPY"
+    )
 
 
 def test_team_and_revenue_agree_on_won_totals_with_capitalized_boolean():

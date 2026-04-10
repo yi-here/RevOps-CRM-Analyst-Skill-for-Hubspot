@@ -49,6 +49,23 @@ def _period_str(tr: TimeRange) -> str:
     return f"{tr.start.strftime('%Y-%m-%d')} to {tr.end.strftime('%Y-%m-%d')}"
 
 
+def _multi_currency_lines(by_currency: dict, value_key: str, count_key: str = "deal_count") -> str:
+    """Render per-currency values as ``<br>``-separated lines for a table cell.
+
+    Used by the executive summary so "Open Pipeline" and "Closed
+    Revenue" rows never sum ¥ + $ into a meaningless total. Returns a
+    single-line string when only one currency is present, matching the
+    pre-fix single-currency appearance.
+    """
+    if not by_currency:
+        return "$0"
+    return "<br>".join(
+        f"{code}: {_fmt_currency_with_code(stats.get(value_key, 0), code)} "
+        f"({int(stats.get(count_key, 0))} deals)"
+        for code, stats in sorted(by_currency.items())
+    )
+
+
 def format_executive_summary(data: dict, tr: TimeRange) -> str:
     p = data["pipeline"]
     wr = data["win_rate"]
@@ -57,19 +74,36 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
     rev = data["revenue"]
     wt = data["weighted"]
 
-    # Render closed revenue per-currency so the exec summary never
-    # quietly sums ¥ + $ into a misleading "$2.02M". If there is only
-    # one currency the output reads identically to the old single-line
-    # format.
-    by_currency = rev.get("by_currency") or {}
-    if by_currency:
-        revenue_lines = "<br>".join(
-            f"{code}: {_fmt_currency_with_code(stats['total_revenue'], code)} "
-            f"({int(stats['deal_count'])} deals)"
-            for code, stats in sorted(by_currency.items())
+    # Render every currency-bearing row per-currency so the exec
+    # summary never quietly sums ¥ + $ into a misleading "$2.02M" or
+    # "$129.06M". Single-currency portals still see the one-line form.
+    pipeline_by_ccy = p.get("by_currency") or {}
+    revenue_by_ccy = rev.get("by_currency") or {}
+    ads_by_ccy = ads.get("by_currency") or {}
+
+    pipeline_cell = _multi_currency_lines(pipeline_by_ccy, "total_value")
+    revenue_cell = _multi_currency_lines(revenue_by_ccy, "total_revenue")
+    ads_cell = (
+        "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats.get('avg_deal_size', 0), code)}"
+            for code, stats in sorted(ads_by_ccy.items())
         )
-    else:
-        revenue_lines = _fmt_currency(rev.get("total_revenue", 0))
+        if ads_by_ccy
+        else _fmt_currency(ads.get("avg_deal_size", 0))
+    )
+    # Avg deal size on the open side reads from pipeline_by_ccy too.
+    open_avg_cell = (
+        "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats.get('avg_deal_size', 0), code)}"
+            for code, stats in sorted(pipeline_by_ccy.items())
+        )
+        if pipeline_by_ccy
+        else _fmt_currency(p.get("avg_deal_size", 0))
+    )
+    vel_currency = vel.get("currency", "USD")
+    vel_cell = (
+        f"{_fmt_currency_with_code(vel['velocity_per_month'], vel_currency)}/month"
+    )
 
     return f"""# Executive Summary
 **Period:** {_period_str(tr)}
@@ -77,20 +111,20 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
 ## Pipeline
 | Metric | Value |
 |---|---|
-| Open Pipeline | {_fmt_currency(p['total_value'])} |
+| Open Pipeline | {pipeline_cell} |
 | Open Deals | {p['total_deals']} |
 | Weighted Pipeline | {_fmt_currency(wt['weighted_value'])} |
-| Avg Deal Size | {_fmt_currency(p.get('avg_deal_size', 0))} |
+| Avg Deal Size | {open_avg_cell} |
 
 ## Performance
 | Metric | Value |
 |---|---|
-| Closed Revenue | {revenue_lines} |
+| Closed Revenue | {revenue_cell} |
 | Deals Won | {wr['won']} |
 | Win Rate | {wr['win_rate']}% |
-| Avg Deal Size (Won) | {_fmt_currency(ads['avg_deal_size'])} |
+| Avg Deal Size (Won) | {ads_cell} |
 | Avg Sales Cycle | {vel['avg_cycle_days']:.0f} days |
-| Pipeline Velocity | {_fmt_currency(vel['velocity_per_month'])}/month |
+| Pipeline Velocity | {vel_cell} |
 """
 
 
@@ -113,30 +147,72 @@ def format_pipeline_report(data: dict, tr: TimeRange) -> str:
         f"**Open pipeline snapshot:** as of {snapshot_ts} "
         f"(`--period` does not affect open-deal totals — HubSpot does not "
         f"expose historical pipeline state)\n",
-        f"**Total Open Pipeline:** {_fmt_currency(total['total_value'])} ({total['total_deals']} deals)\n",
     ]
+
+    # Per-currency totals — never a mixed sum. Render one table row per
+    # currency so ¥118M Japan opens are never quietly added to $11M USD.
+    by_currency = total.get("by_currency") or {}
+    if by_currency:
+        lines.append("## Total Open Pipeline\n")
+        lines.append("| Currency | Value | Deals | Avg Size |")
+        lines.append("|---|---|---|---|")
+        for code in sorted(by_currency.keys()):
+            stats = by_currency[code]
+            lines.append(
+                f"| {code} "
+                f"| {_fmt_currency_with_code(stats['total_value'], code)} "
+                f"| {int(stats['deal_count'])} "
+                f"| {_fmt_currency_with_code(stats['avg_deal_size'], code)} |"
+            )
+        if len(by_currency) > 1:
+            lines.append(
+                "\n> Multi-currency totals are reported separately — JPY "
+                "and USD amounts are never summed.\n"
+            )
+    else:
+        lines.append(
+            f"**Total Open Pipeline:** {_fmt_currency(total.get('total_value', 0))} "
+            f"({total.get('total_deals', 0)} deals)\n"
+        )
 
     by_stage = data["by_stage"]
     if not isinstance(by_stage, pd.DataFrame) or by_stage.empty:
         lines.append("_No stage breakdown available._\n")
     else:
-        lines.append("## By Stage\n")
-        lines.append("| Stage | Deals | Value | Avg Size |")
-        lines.append("|---|---|---|---|")
-        for _, row in by_stage.iterrows():
-            lines.append(
-                f"| {row.get('stage_label', row.get('dealstage', 'N/A'))} "
-                f"| {int(row['deal_count'])} "
-                f"| {_fmt_currency(row['total_value'])} "
-                f"| {_fmt_currency(row['avg_value'])} |"
-            )
+        lines.append("\n## By Stage\n")
+        has_currency = "currency" in by_stage.columns
+        if has_currency:
+            lines.append("| Stage | Currency | Deals | Value | Avg Size |")
+            lines.append("|---|---|---|---|---|")
+            for _, row in by_stage.iterrows():
+                code = row.get("currency", "USD")
+                lines.append(
+                    f"| {row.get('stage_label', row.get('dealstage', 'N/A'))} "
+                    f"| {code} "
+                    f"| {int(row['deal_count'])} "
+                    f"| {_fmt_currency_with_code(row['total_value'], code)} "
+                    f"| {_fmt_currency_with_code(row['avg_value'], code)} |"
+                )
+        else:
+            lines.append("| Stage | Deals | Value | Avg Size |")
+            lines.append("|---|---|---|---|")
+            for _, row in by_stage.iterrows():
+                lines.append(
+                    f"| {row.get('stage_label', row.get('dealstage', 'N/A'))} "
+                    f"| {int(row['deal_count'])} "
+                    f"| {_fmt_currency(row['total_value'])} "
+                    f"| {_fmt_currency(row['avg_value'])} |"
+                )
 
+    vel_currency = vel.get("currency", "USD")
     lines.extend([
         f"\n## Period Metrics ({_period_str(tr)})\n",
         "_These metrics use closed deals in the requested period._\n",
         f"- **Win Rate:** {wr['win_rate']}% ({wr['won']}W / {wr['lost']}L)",
         f"- **Avg Sales Cycle:** {cycle['avg_days']:.0f} days (median: {cycle['median_days']:.0f})",
-        f"- **Pipeline Velocity:** {_fmt_currency(vel['velocity_per_month'])}/month",
+        f"- **Pipeline Velocity:** "
+        f"{_fmt_currency_with_code(vel['velocity_per_month'], vel_currency)}/month "
+        f"({vel_currency} primary)",
     ])
 
     return "\n".join(lines)
@@ -216,7 +292,20 @@ def format_funnel_report(data: dict, tr: TimeRange) -> str:
         )
         return "\n".join(lines)
 
-    lines.append(f"**Total Contacts:** {funnel['total_contacts']}\n")
+    total = funnel.get("total_contacts", 0)
+    sampled = funnel.get("sampled_contacts", total)
+    lines.append(f"**Total Contacts:** {total:,}\n")
+    if funnel.get("truncated"):
+        lines.append(
+            f"> ⚠️  **Sampled breakdown:** the HubSpot Search API caps each "
+            f"query at 10,000 rows, so the per-stage breakdown and "
+            f"conversion rates below are computed from a {sampled:,}-contact "
+            f"sample out of {total:,} total. The top-of-funnel "
+            f"**Total Contacts** number is authoritative (pulled from the "
+            f"server-reported count), but the conversion percentages are "
+            f"representative only. For full-precision rates, scope the "
+            f"report to a narrower period.\n"
+        )
 
     if funnel.get("stages"):
         lines.append("## Lifecycle Stages\n")

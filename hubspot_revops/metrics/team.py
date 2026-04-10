@@ -6,10 +6,12 @@ import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import DealExtractor
-from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
+from hubspot_revops.metrics._utils import (
+    attach_currency,
+    to_bool_series,
+    to_numeric_series,
+)
 from hubspot_revops.schema.models import Owner
-
-DEFAULT_CURRENCY = "USD"
 
 
 def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFrame:
@@ -22,12 +24,8 @@ def _prep(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize amount + currency + won flag columns for safe groupby."""
     if df.empty:
         return df
-    df = df.copy()
+    df = attach_currency(df)
     df["amount"] = to_numeric_series(df, "amount")
-    if "deal_currency_code" in df.columns:
-        df["currency"] = df["deal_currency_code"].fillna(DEFAULT_CURRENCY).replace("", DEFAULT_CURRENCY)
-    else:
-        df["currency"] = DEFAULT_CURRENCY
     df["is_won"] = to_bool_series(df, "hs_is_closed_won")
     if "hubspot_owner_id" not in df.columns:
         df["hubspot_owner_id"] = ""

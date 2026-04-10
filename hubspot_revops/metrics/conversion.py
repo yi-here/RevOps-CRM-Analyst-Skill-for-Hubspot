@@ -32,7 +32,13 @@ STAGE_DATE_PROPERTIES = {
 
 def _empty_funnel(error: str | None = None) -> dict:
     """Shape for a funnel payload when contacts search fails or is empty."""
-    payload: dict = {"stages": {}, "conversions": {}, "total_contacts": 0}
+    payload: dict = {
+        "stages": {},
+        "conversions": {},
+        "total_contacts": 0,
+        "sampled_contacts": 0,
+        "truncated": False,
+    }
     if error:
         payload["error"] = error
     return payload
@@ -48,14 +54,49 @@ def funnel_conversion_rates(
     occasionally returns 502s under load and the client's retry policy
     only covers transient blips, not sustained outages. The funnel report
     renders a banner instead of crashing the whole command.
+
+    The contacts Search API caps results at 10,000 per query. When the
+    portal has more contacts than that — the bug report mentioned 7.1M
+    — the old code returned ``len(contacts)`` which maxed out at 10K
+    and grossly misrepresented the top of the funnel. We now read the
+    full server-side count via ``count_via_search`` and expose it as
+    ``total_contacts``, while the paginated (capped) set drives the
+    per-stage breakdown. A ``truncated`` flag signals the mismatch so
+    the template can render a warning banner.
     """
+    filters = [
+        {"propertyName": "createdate", "operator": "GTE", "value": time_range.start_ms},
+        {"propertyName": "createdate", "operator": "LTE", "value": time_range.end_ms},
+    ]
+    try:
+        total_count = contact_extractor.count_via_search(
+            filter_groups=[{"filters": filters}]
+        )
+    except Exception as exc:
+        log.warning("contacts count_via_search failed: %s", exc)
+        total_count = None
+
     try:
         contacts = contact_extractor.get_new_contacts(time_range)
     except Exception as exc:
         log.warning("contacts search failed in funnel_conversion_rates: %s", exc)
         return _empty_funnel(error=str(exc))
     if contacts.empty:
-        return _empty_funnel()
+        payload = _empty_funnel()
+        if total_count:
+            # Count succeeded but the paginated fetch came back empty —
+            # unlikely, but preserve the count for display.
+            payload["total_contacts"] = total_count
+        return payload
+
+    sampled = len(contacts)
+    # Prefer the server-reported total if available, else fall back to
+    # the DataFrame attrs (populated by the base search), else the
+    # sampled length.
+    reported_total = total_count
+    if not reported_total:
+        reported_total = int(contacts.attrs.get("hs_total", sampled))
+    truncated = reported_total > sampled
 
     stage_counts = {}
     for stage in LIFECYCLE_STAGES:
@@ -64,9 +105,13 @@ def funnel_conversion_rates(
             reached = contacts[contacts[date_prop].notna()]
             stage_counts[stage] = len(reached)
         elif stage == "subscriber":
-            stage_counts[stage] = len(contacts)
+            # "Subscriber" = top-of-funnel; use the server total so the
+            # top number is correct even when we sampled the first 10K.
+            stage_counts[stage] = reported_total
 
-    # Calculate step-wise conversion rates
+    # Calculate step-wise conversion rates. Conversion percentages from
+    # the sampled set are representative only — we flag the caveat via
+    # ``truncated`` rather than pretending the rates cover 7M contacts.
     conversions = {}
     stages = list(stage_counts.keys())
     for i in range(len(stages) - 1):
@@ -84,7 +129,9 @@ def funnel_conversion_rates(
     return {
         "stages": stage_counts,
         "conversions": conversions,
-        "total_contacts": len(contacts),
+        "total_contacts": reported_total,
+        "sampled_contacts": sampled,
+        "truncated": truncated,
     }
 
 

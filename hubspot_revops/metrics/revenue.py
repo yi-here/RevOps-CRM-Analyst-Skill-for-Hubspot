@@ -6,30 +6,18 @@ import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import DealExtractor
-from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
-
-DEFAULT_CURRENCY = "USD"
+from hubspot_revops.metrics._utils import (
+    DEFAULT_CURRENCY,
+    attach_currency,
+    pick_primary_currency,
+    to_bool_series,
+    to_numeric_series,
+)
 
 
 def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFrame:
     if pipeline_filter and not df.empty and "pipeline" in df.columns:
         return df[df["pipeline"] == pipeline_filter]
-    return df
-
-
-def _attach_currency(df: pd.DataFrame) -> pd.DataFrame:
-    """Add a normalized ``currency`` column, defaulting to USD."""
-    if df.empty:
-        return df
-    df = df.copy()
-    if "deal_currency_code" in df.columns:
-        df["currency"] = (
-            df["deal_currency_code"]
-            .fillna(DEFAULT_CURRENCY)
-            .replace("", DEFAULT_CURRENCY)
-        )
-    else:
-        df["currency"] = DEFAULT_CURRENCY
     return df
 
 
@@ -102,7 +90,7 @@ def closed_revenue(
     if won.empty:
         return empty_payload
 
-    won = _attach_currency(won)
+    won = attach_currency(won)
     won["amount"] = to_numeric_series(won, "amount")
 
     by_currency: dict[str, dict] = {}
@@ -116,9 +104,7 @@ def closed_revenue(
             "min_deal": float(amounts.min()) if len(group) else 0.0,
         }
 
-    # Primary currency = whichever has the most deals. Ties are broken
-    # alphabetically for determinism.
-    primary = max(by_currency.items(), key=lambda kv: (kv[1]["deal_count"], kv[0]))[0]
+    primary = pick_primary_currency(by_currency)
     primary_stats = by_currency[primary]
     return {
         "by_currency": by_currency,
@@ -148,7 +134,7 @@ def revenue_by_owner(
     if won.empty:
         return pd.DataFrame()
 
-    won = _attach_currency(won)
+    won = attach_currency(won)
     won["amount"] = to_numeric_series(won, "amount")
     grouped = won.groupby(["hubspot_owner_id", "currency"]).agg(
         total_revenue=("amount", "sum"),

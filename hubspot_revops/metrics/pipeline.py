@@ -8,7 +8,13 @@ import pandas as pd
 
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import DealExtractor
-from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
+from hubspot_revops.metrics._utils import (
+    DEFAULT_CURRENCY,
+    attach_currency,
+    pick_primary_currency,
+    to_bool_series,
+    to_numeric_series,
+)
 from hubspot_revops.schema.models import CRMSchema
 
 
@@ -21,16 +27,48 @@ def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFr
 def total_pipeline_value(
     deal_extractor: DealExtractor, pipeline_filter: str | None = None
 ) -> dict:
-    """Calculate total open pipeline value."""
-    df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
-    if df.empty:
-        return {"total_deals": 0, "total_value": 0.0}
+    """Calculate total open pipeline value, grouped by currency.
 
+    Summing ``amount`` across currencies produced the same class of bug
+    as the revenue report — a ¥1M open deal was counted as $1M on the
+    top line. Return a ``by_currency`` dict and expose the primary
+    currency (highest deal count) at the top level for back-compat.
+    Deal COUNTS are currency-agnostic (3 deals is 3 deals) so
+    ``total_deals`` still reflects the total across every currency;
+    only VALUE fields are primary-currency only.
+    """
+    df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
+    empty_payload = {
+        "by_currency": {},
+        "primary_currency": DEFAULT_CURRENCY,
+        "total_deals": 0,
+        "total_value": 0.0,
+        "avg_deal_size": 0.0,
+    }
+    if df.empty:
+        return empty_payload
+
+    df = attach_currency(df)
     df["amount"] = to_numeric_series(df, "amount")
+
+    by_currency: dict[str, dict] = {}
+    for code, group in df.groupby("currency"):
+        amounts = group["amount"]
+        by_currency[str(code)] = {
+            "deal_count": int(len(group)),
+            "total_value": float(amounts.sum()),
+            "avg_deal_size": float(amounts.mean()) if len(group) else 0.0,
+        }
+
+    primary = pick_primary_currency(by_currency)
+    primary_stats = by_currency[primary]
     return {
-        "total_deals": len(df),
-        "total_value": df["amount"].sum(),
-        "avg_deal_size": df["amount"].mean(),
+        "by_currency": by_currency,
+        "primary_currency": primary,
+        # Count is universal; value + avg are primary-currency only.
+        "total_deals": int(len(df)),
+        "total_value": primary_stats["total_value"],
+        "avg_deal_size": primary_stats["avg_deal_size"],
     }
 
 
@@ -39,11 +77,18 @@ def pipeline_by_stage(
     schema: CRMSchema,
     pipeline_filter: str | None = None,
 ) -> pd.DataFrame:
-    """Break down open pipeline by stage (pipeline-aware, no label collisions)."""
+    """Break down open pipeline by stage, pipeline-aware and currency-aware.
+
+    Adds ``currency`` to the group key so a ¥ Japan stage and a $
+    enterprise stage never share a row. The output DataFrame gains a
+    ``currency`` column which the template uses to render a currency
+    prefix on every stage row.
+    """
     df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
     if df.empty:
         return pd.DataFrame()
 
+    df = attach_currency(df)
     df["amount"] = to_numeric_series(df, "amount")
 
     # Build a (pipeline_id, stage_id) -> (stage_label, pipeline_label) map.
@@ -56,7 +101,8 @@ def pipeline_by_stage(
             for s in pl.stages:
                 stage_info[(pl.pipeline_id, s.stage_id)] = (s.label, pl.label)
 
-    group_cols = ["pipeline", "dealstage"] if "pipeline" in df.columns else ["dealstage"]
+    base_group_cols = ["pipeline", "dealstage"] if "pipeline" in df.columns else ["dealstage"]
+    group_cols = base_group_cols + ["currency"]
     grouped = df.groupby(group_cols).agg(
         deal_count=("id", "count"),
         total_value=("amount", "sum"),
@@ -75,7 +121,9 @@ def pipeline_by_stage(
 
     grouped["stage_label"] = grouped.apply(_lookup_label, axis=1)
     grouped["pipeline_label"] = grouped.apply(_lookup_pipeline_label, axis=1)
-    return grouped.sort_values("total_value", ascending=False)
+    return grouped.sort_values(
+        ["currency", "total_value"], ascending=[True, False]
+    ).reset_index(drop=True)
 
 
 def win_rate(
@@ -106,18 +154,54 @@ def avg_deal_size(
     time_range: TimeRange,
     pipeline_filter: str | None = None,
 ) -> dict:
-    """Calculate average deal size for won deals in a period."""
-    won = _filter_pipeline(
-        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
-    )
-    if won.empty:
-        return {"avg_deal_size": 0.0, "total_revenue": 0.0, "deal_count": 0}
+    """Calculate average deal size for won deals in a period, per currency.
 
+    Averaging across currencies — e.g. ``mean([$30k, $40k, ¥1M])`` —
+    produces a nonsense number. Bucket by currency and expose
+    primary-currency values at the top level (matches the revenue and
+    total_pipeline_value shape).
+    """
+    # Mirror the team / revenue pattern: fetch all closed deals and
+    # filter wins in Python so we agree with revenue on exactly which
+    # deals count as "won" (see the capitalized-boolean regression
+    # test in test_bug_fixes.py).
+    closed = _filter_pipeline(
+        deal_extractor.get_closed_deals(time_range), pipeline_filter
+    )
+    empty_payload = {
+        "by_currency": {},
+        "primary_currency": DEFAULT_CURRENCY,
+        "avg_deal_size": 0.0,
+        "total_revenue": 0.0,
+        "deal_count": 0,
+    }
+    if closed.empty:
+        return empty_payload
+    won_mask = to_bool_series(closed, "hs_is_closed_won")
+    won = closed[won_mask].copy()
+    if won.empty:
+        return empty_payload
+
+    won = attach_currency(won)
     won["amount"] = to_numeric_series(won, "amount")
+
+    by_currency: dict[str, dict] = {}
+    for code, group in won.groupby("currency"):
+        amounts = group["amount"]
+        by_currency[str(code)] = {
+            "deal_count": int(len(group)),
+            "avg_deal_size": float(amounts.mean()) if len(group) else 0.0,
+            "total_revenue": float(amounts.sum()),
+        }
+
+    primary = pick_primary_currency(by_currency)
+    primary_stats = by_currency[primary]
     return {
-        "avg_deal_size": won["amount"].mean(),
-        "total_revenue": won["amount"].sum(),
-        "deal_count": len(won),
+        "by_currency": by_currency,
+        "primary_currency": primary,
+        "avg_deal_size": primary_stats["avg_deal_size"],
+        "total_revenue": primary_stats["total_revenue"],
+        "deal_count": int(len(won)),
     }
 
 
@@ -150,17 +234,34 @@ def pipeline_velocity(
     time_range: TimeRange,
     pipeline_filter: str | None = None,
 ) -> dict:
-    """Calculate pipeline velocity = (deals * win_rate * avg_size) / avg_cycle."""
+    """Calculate pipeline velocity = (deals × win_rate × avg_size) / cycle.
+
+    Velocity is denominated in the **primary currency** only — mixing
+    ``avg_size`` from USD wins with a deal count spanning JPY + USD
+    produces a meaningless number. We look up the primary currency of
+    the open pipeline and use that currency's deal count + avg_size to
+    compute a single velocity figure, tagged with the currency code so
+    templates can render it with the right symbol.
+    """
     wr = win_rate(deal_extractor, time_range, pipeline_filter=pipeline_filter)
     ads = avg_deal_size(deal_extractor, time_range, pipeline_filter=pipeline_filter)
     scl = sales_cycle_length(deal_extractor, time_range, pipeline_filter=pipeline_filter)
 
     open_pipeline = total_pipeline_value(deal_extractor, pipeline_filter=pipeline_filter)
-    num_deals = open_pipeline["total_deals"]
-    win_pct = wr["win_rate"] / 100
-    avg_size = ads["avg_deal_size"]
-    avg_cycle = scl["avg_days"] if scl["avg_days"] > 0 else 1
+    primary = open_pipeline.get("primary_currency", DEFAULT_CURRENCY)
+    open_by_currency = open_pipeline.get("by_currency", {}) or {}
+    open_primary_stats = open_by_currency.get(primary, {})
+    num_deals = int(open_primary_stats.get("deal_count", 0))
 
+    # Pull avg_size from the SAME currency in the won deals, not the
+    # won-side primary currency (which may differ when a rep has
+    # lots of small JPY closes and a few big USD opens).
+    won_by_currency = ads.get("by_currency", {}) or {}
+    won_primary_stats = won_by_currency.get(primary, {})
+    avg_size = float(won_primary_stats.get("avg_deal_size", 0.0))
+
+    win_pct = wr["win_rate"] / 100
+    avg_cycle = scl["avg_days"] if scl["avg_days"] > 0 else 1
     velocity = (num_deals * win_pct * avg_size) / avg_cycle
 
     return {
@@ -170,4 +271,5 @@ def pipeline_velocity(
         "win_rate": wr["win_rate"],
         "avg_deal_size": avg_size,
         "avg_cycle_days": scl["avg_days"],
+        "currency": primary,
     }

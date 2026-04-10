@@ -32,31 +32,21 @@ import pandas as pd
 from hubspot_revops.extractors.base import TimeRange
 from hubspot_revops.extractors.deals import CLOSED_LOST_PROPERTIES, DealExtractor
 from hubspot_revops.metrics._quality import find_zero_engagement_deals
-from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
+from hubspot_revops.metrics._utils import (
+    DEFAULT_CURRENCY,
+    attach_currency,
+    pick_primary_currency,
+    to_bool_series,
+    to_numeric_series,
+)
 from hubspot_revops.schema.models import Owner
 
 COVERAGE_WARN_THRESHOLD = 0.5
-DEFAULT_CURRENCY = "USD"
 
 
 def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFrame:
     if pipeline_filter and not df.empty and "pipeline" in df.columns:
         return df[df["pipeline"] == pipeline_filter]
-    return df
-
-
-def _attach_currency(df: pd.DataFrame) -> pd.DataFrame:
-    """Add a normalized ``currency`` column, defaulting to USD."""
-    if df.empty:
-        return df
-    if "deal_currency_code" in df.columns:
-        df["currency"] = (
-            df["deal_currency_code"]
-            .fillna(DEFAULT_CURRENCY)
-            .replace("", DEFAULT_CURRENCY)
-        )
-    else:
-        df["currency"] = DEFAULT_CURRENCY
     return df
 
 
@@ -147,7 +137,7 @@ def closed_lost_analysis(
     lost["amount"] = to_numeric_series(lost, "amount")
     if "hubspot_owner_id" not in lost.columns:
         lost["hubspot_owner_id"] = ""
-    lost = _attach_currency(lost)
+    lost = attach_currency(lost)
 
     # Per-currency rep scorecard + reason breakdown.
     by_currency: dict[str, dict] = {}
@@ -159,10 +149,7 @@ def closed_lost_analysis(
             "total_lost_value": float(group["amount"].sum()),
         }
 
-    # Primary currency = highest deal count; alphabetical tiebreak.
-    primary = max(
-        by_currency.items(), key=lambda kv: (kv[1]["total_lost_deals"], kv[0])
-    )[0]
+    primary = pick_primary_currency(by_currency, count_key="total_lost_deals")
     primary_stats = by_currency[primary]
 
     # Ghost deals — currency-agnostic count across all lost deals.
