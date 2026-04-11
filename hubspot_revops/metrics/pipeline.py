@@ -41,6 +41,34 @@ def _attach_currency(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _fetch_won(
+    deal_extractor: DealExtractor,
+    time_range: TimeRange,
+    pipeline_filter: str | None,
+) -> pd.DataFrame:
+    """Fetch closed deals and filter to wins *in Python*.
+
+    Mirrors ``revenue._fetch_won``. The pipeline metrics (``avg_deal_size``,
+    ``sales_cycle_length``) previously passed ``won_only=True`` to
+    ``get_closed_deals``, which appends ``hs_is_closed_won EQ "true"``
+    to the HubSpot Search filter — a strict, case-sensitive string
+    match. The SDK sometimes returns ``hs_is_closed_won`` as
+    ``"True"`` or ``"TRUE"``, in which case the API filter silently
+    excludes those wins and the pipeline metrics disagreed with both
+    the team scorecard (~$25K gap) and revenue (same ~$25K gap but
+    with the opposite bias). Routing every win-path through the same
+    Python-side ``to_bool_series`` filter eliminates the inconsistency
+    so every money metric in the skill agrees on "what counts as won".
+    """
+    closed = _filter_pipeline(
+        deal_extractor.get_closed_deals(time_range), pipeline_filter
+    )
+    if closed.empty:
+        return closed
+    won_mask = to_bool_series(closed, "hs_is_closed_won")
+    return closed[won_mask].copy()
+
+
 def total_pipeline_value(
     deal_extractor: DealExtractor, pipeline_filter: str | None = None
 ) -> dict:
@@ -197,10 +225,12 @@ def avg_deal_size(
     deal would produce an "average" of $525,000, which is meaningless.
     Mirrors ``total_pipeline_value`` and ``revenue.closed_revenue`` so
     every money metric in the skill buckets currencies consistently.
+
+    Uses the Python-side ``_fetch_won`` filter rather than the API-level
+    ``won_only=True`` parameter; see ``_fetch_won`` for why (SDK boolean
+    case-sensitivity bug that created a ~$25K gap versus team/revenue).
     """
-    won = _filter_pipeline(
-        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
-    )
+    won = _fetch_won(deal_extractor, time_range, pipeline_filter)
     empty_payload = {
         "by_currency": {},
         "primary_currency": DEFAULT_CURRENCY,
@@ -242,10 +272,13 @@ def sales_cycle_length(
     time_range: TimeRange,
     pipeline_filter: str | None = None,
 ) -> dict:
-    """Calculate average sales cycle length for won deals."""
-    won = _filter_pipeline(
-        deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
-    )
+    """Calculate average sales cycle length for won deals.
+
+    Uses the Python-side ``_fetch_won`` filter rather than the API-level
+    ``won_only=True`` parameter to stay consistent with every other
+    money metric in the skill. See ``_fetch_won`` for details.
+    """
+    won = _fetch_won(deal_extractor, time_range, pipeline_filter)
     if won.empty:
         return {"avg_days": 0, "median_days": 0, "deal_count": 0}
 

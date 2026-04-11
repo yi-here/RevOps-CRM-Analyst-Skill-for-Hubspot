@@ -844,6 +844,105 @@ def test_avg_deal_size_empty_payload_shape():
     assert result["primary_currency"] == "USD"
 
 
+# --- Bug 13: pipeline win-filter consistency with team / revenue ----------
+#
+# Sibling of the team-vs-revenue ~$25K gap. ``pipeline.avg_deal_size``
+# and ``pipeline.sales_cycle_length`` used to pass ``won_only=True`` to
+# ``get_closed_deals``, which appends the HubSpot API filter
+# ``hs_is_closed_won EQ "true"`` — a strict, case-sensitive string
+# match. The SDK sometimes returns the flag as "True" / "TRUE", and
+# those wins were silently dropped from the pipeline metrics even
+# though team.rep_scorecard (Python filter via to_bool_series)
+# correctly included them. Fixed by routing both functions through a
+# shared ``_fetch_won`` that fetches closed deals once and applies the
+# Python-side filter, matching the revenue._fetch_won pattern.
+
+
+def test_pipeline_avg_deal_size_counts_capitalized_boolean_wins():
+    """"True"/"TRUE" won flags must be counted as wins — the API filter
+    path used to drop them silently."""
+    extractor = MagicMock()
+    # Four won deals with varying boolean case + one lost deal to make
+    # sure the Python filter still excludes losses. If avg_deal_size
+    # still used the API filter, the MagicMock would never see the
+    # won_only=True kwarg take effect — the bug manifests as the test
+    # below passing trivially. To make the test meaningful we assert
+    # the exact set of deal IDs in the result so capitalization drops
+    # would show up as a count mismatch.
+    closed = pd.DataFrame({
+        "id": ["1", "2", "3", "4", "5"],
+        "amount": ["10000", "20000", "30000", "40000", "9999"],
+        "hs_is_closed_won": ["true", "True", "TRUE", "true", "false"],
+        "deal_currency_code": ["USD", "USD", "USD", "USD", "USD"],
+        "pipeline": ["default", "default", "default", "default", "default"],
+        "createdate": ["2026-01-01"] * 5,
+        "closedate": ["2026-02-01"] * 5,
+    })
+    extractor.get_closed_deals.return_value = closed
+
+    result = pipeline.avg_deal_size(extractor, _tr())
+    # 4 wins totalling 100k, 1 loss excluded. Avg = 25k. If the API
+    # filter were still in place and the mock didn't honour it, the
+    # loss row (9999) would slip in and skew the average.
+    assert result["deal_count"] == 4
+    assert result["total_revenue"] == 100_000
+    assert result["avg_deal_size"] == 25_000
+
+
+def test_pipeline_avg_deal_size_does_not_request_won_only_api_filter():
+    """Regression guard: the function must NOT pass ``won_only=True``
+    to ``get_closed_deals``. That code path uses an API filter that
+    drops ``hs_is_closed_won = "True"`` wins on a case-sensitive
+    string match."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame()
+
+    pipeline.avg_deal_size(extractor, _tr())
+
+    assert extractor.get_closed_deals.called
+    for call in extractor.get_closed_deals.call_args_list:
+        # Neither kwarg nor positional won_only=True should be present.
+        assert call.kwargs.get("won_only") is not True, (
+            "avg_deal_size must use the Python-side won filter, not the "
+            "API-level won_only=True path"
+        )
+        # Only time_range is passed positionally; if a second positional
+        # arg ever shows up it had better not be True.
+        assert len(call.args) < 2 or call.args[1] is not True
+
+
+def test_pipeline_sales_cycle_length_counts_capitalized_boolean_wins():
+    """Same capitalization bug in sales_cycle_length — "True"/"TRUE"
+    wins used to be dropped by the API filter."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["10000", "20000", "30000"],
+        "hs_is_closed_won": ["True", "TRUE", "false"],
+        "deal_currency_code": ["USD", "USD", "USD"],
+        "pipeline": ["default", "default", "default"],
+        "createdate": ["2026-01-01", "2026-01-05", "2026-01-10"],
+        "closedate": ["2026-02-01", "2026-02-10", "2026-02-15"],
+    })
+
+    result = pipeline.sales_cycle_length(extractor, _tr())
+    # 2 wins kept (both capitalized), 1 loss dropped.
+    assert result["deal_count"] == 2
+    # avg cycle = (31 + 36) / 2 ≈ 33.5 days
+    assert 33 <= result["avg_days"] <= 34
+
+
+def test_pipeline_sales_cycle_length_does_not_request_won_only_api_filter():
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame()
+
+    pipeline.sales_cycle_length(extractor, _tr())
+
+    for call in extractor.get_closed_deals.call_args_list:
+        assert call.kwargs.get("won_only") is not True
+        assert len(call.args) < 2 or call.args[1] is not True
+
+
 def test_pipeline_velocity_reads_back_compat_avg_deal_size():
     """pipeline_velocity() must still resolve ads['avg_deal_size'] to a
     scalar after the multi-currency refactor, otherwise the velocity
