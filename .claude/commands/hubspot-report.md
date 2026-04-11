@@ -32,7 +32,19 @@ cd $PROJECT_DIR && python -m hubspot_revops.cli report <type> --period <period>
 ```
 
 5. Present the formatted markdown report to the user.
-6. Offer follow-up analysis options (drill into specific metrics, compare periods, etc.)
+6. **If the output contains `FALLBACK_TO_MCP`**, the report method
+   crashed at runtime (HubSpot 5xx, schema mismatch, or similar). Do
+   NOT retry the same CLI command. Instead, hand off to HubSpot's
+   official MCP server:
+   - Read the error string inside the banner to understand what failed
+   - Pick the right MCP tool for the equivalent raw-records query
+     (`search_deals`, `search_contacts`, `get_engagements`, etc.)
+   - Assemble the filters / time range the original report would have
+     used and run the MCP query directly
+   - Synthesize the answer from the raw records and explain the
+     workaround to the user
+7. Offer follow-up analysis options (drill into specific metrics,
+   compare periods, etc.)
 
 If dependencies are not installed, first run:
 ```bash

@@ -100,10 +100,28 @@ class HubSpotClient:
             limit=min(limit, 200),
             after=after or "0",
         )
-        search_api = getattr(self.api.crm, _sdk_module(object_type), self.api.crm.objects)
+        module_name = _sdk_module(object_type)
+        sdk_namespace = getattr(self.api.crm, module_name, self.api.crm.objects)
         # Search API has its own 5 req/sec rate limit
         self.search_rate_limiter.wait_if_needed()
-        return self._rate_limited(search_api.search_api.do_search, public_object_search_request=request)
+        # Typed namespaces (contacts, deals, companies, ...) infer the object
+        # type from the namespace itself, so ``do_search`` takes only the
+        # search request. The generic ``crm.objects`` search endpoint — used
+        # for engagements (meetings/calls/emails/notes/tasks) and custom
+        # objects, which have no dedicated SDK namespace — requires
+        # ``object_type`` as the first positional argument, otherwise it
+        # raises ``TypeError: do_search() missing 1 required positional
+        # argument: 'object_type'`` and every activity report crashes.
+        if module_name == "objects":
+            return self._rate_limited(
+                sdk_namespace.search_api.do_search,
+                object_type,
+                public_object_search_request=request,
+            )
+        return self._rate_limited(
+            sdk_namespace.search_api.do_search,
+            public_object_search_request=request,
+        )
 
     # --- Properties / Schema ---
 

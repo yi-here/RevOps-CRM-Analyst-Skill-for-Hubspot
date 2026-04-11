@@ -52,8 +52,16 @@ class ActivityExtractor(BaseExtractor):
         ``hs_lastmodifieddate`` column. This eliminates the "activity
         report always shows 0" bug where ``hs_createdate`` silently
         excluded every engagement.
+
+        Uses a try/finally around ``self.object_type`` so a caller
+        that reuses the same ``ActivityExtractor`` instance across
+        engagement types never observes a leaked value from a previous
+        ``get_activities`` call. Previously ``self.object_type`` was
+        overwritten and never restored, so a subsequent call to
+        ``self.search`` or ``self.count`` on the same instance (for
+        example from ``meeting_history``) would silently use the last
+        activity type instead of the caller's intended object.
         """
-        self.object_type = activity_type
         props = properties or ENGAGEMENT_PROPERTIES.get(
             activity_type, ["hubspot_owner_id", "hs_createdate"]
         )
@@ -61,32 +69,37 @@ class ActivityExtractor(BaseExtractor):
             ENGAGEMENT_DATE_PROPERTIES.get(activity_type, "hs_timestamp"),
             "hs_lastmodifieddate",
         ]
-        last_error: Exception | None = None
-        for date_prop in candidates:
-            try:
-                df = self.search_in_time_range(
-                    time_range=time_range,
-                    date_property=date_prop,
-                    properties=props,
-                )
-            except Exception as exc:
-                last_error = exc
-                log.debug(
-                    "activity search failed on %s using %s: %s",
+        original_object_type = self.object_type
+        self.object_type = activity_type
+        try:
+            last_error: Exception | None = None
+            for date_prop in candidates:
+                try:
+                    df = self.search_in_time_range(
+                        time_range=time_range,
+                        date_property=date_prop,
+                        properties=props,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    log.debug(
+                        "activity search failed on %s using %s: %s",
+                        activity_type,
+                        date_prop,
+                        exc,
+                    )
+                    continue
+                if not df.empty:
+                    return df
+            if last_error is not None:
+                log.warning(
+                    "activity search for %s exhausted fallbacks: %s",
                     activity_type,
-                    date_prop,
-                    exc,
+                    last_error,
                 )
-                continue
-            if not df.empty:
-                return df
-        if last_error is not None:
-            log.warning(
-                "activity search for %s exhausted fallbacks: %s",
-                activity_type,
-                last_error,
-            )
-        return pd.DataFrame()
+            return pd.DataFrame()
+        finally:
+            self.object_type = original_object_type
 
     def get_all_activities(self, time_range: TimeRange) -> dict[str, pd.DataFrame]:
         """Fetch all engagement types within a time range."""

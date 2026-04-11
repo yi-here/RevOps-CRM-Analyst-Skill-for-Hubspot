@@ -21,16 +21,31 @@ cd $PROJECT_DIR && python -m hubspot_revops.cli ask "$ARGUMENTS"
 ```
 
 3. Present the results clearly.
-4. If the question is ambiguous, interpret it using these guidelines:
+4. **If the output contains `FALLBACK_TO_MCP`**, the skill could not
+   confidently answer the question. Do NOT re-run the same CLI command.
+   Instead, hand off to HubSpot's official MCP server:
+   - Parse the original question from the banner
+   - Pick the right MCP tool: `search_deals` / `search_contacts` /
+     `search_companies` with filters, `get_deal` / `get_contact` /
+     `get_company` for single-record lookups, or `get_engagements`
+     for activity timelines
+   - Run the raw query and synthesize the answer from the records
+   - If HubSpot's MCP is not installed, tell the user to run
+     `claude mcp add --transport http hubspot https://mcp.hubspot.com/anthropic`
+     or suggest a related canned report
+
+5. If the question is clearly ambiguous (no fallback banner, but the
+   auto-classified report doesn't feel right), interpret it using
+   these guidelines:
    - Pipeline questions → pipeline report
-   - Revenue/bookings/MRR → revenue report  
+   - Revenue/bookings/MRR → revenue report
    - Win rate/conversion/funnel → funnel or pipeline metrics
    - Rep/team/quota → team scorecard
    - Calls/emails/meetings → activity report
    - Forecast/weighted → forecast metrics
    - General "how are we doing" → executive summary
 
-5. Offer to drill deeper into specific metrics or compare time periods.
+6. Offer to drill deeper into specific metrics or compare time periods.
 
 If dependencies are not installed, first run:
 ```bash

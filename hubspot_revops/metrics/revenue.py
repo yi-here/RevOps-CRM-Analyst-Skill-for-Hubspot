@@ -165,16 +165,25 @@ def revenue_by_owner(
 
 
 def revenue_by_pipeline(deal_extractor: DealExtractor, time_range: TimeRange) -> pd.DataFrame:
-    """Revenue grouped by pipeline."""
+    """Revenue grouped by pipeline AND currency.
+
+    Returns a DataFrame with columns ``[pipeline, currency, total_revenue, deal_count]``.
+    One row per ``(pipeline, currency)`` pair so a "Japan Sales Pipeline"
+    with mixed ¥ + $ deals never collapses into a single mixed-currency
+    total.
+    """
     won = _fetch_won(deal_extractor, time_range, pipeline_filter=None)
     if won.empty:
         return pd.DataFrame()
 
+    won = _attach_currency(won)
     won["amount"] = to_numeric_series(won, "amount")
-    return won.groupby("pipeline").agg(
+    return won.groupby(["pipeline", "currency"]).agg(
         total_revenue=("amount", "sum"),
         deal_count=("id", "count"),
-    ).reset_index().sort_values("total_revenue", ascending=False)
+    ).reset_index().sort_values(
+        ["pipeline", "total_revenue"], ascending=[True, False]
+    ).reset_index(drop=True)
 
 
 def mrr_arr_from_deals(
@@ -182,7 +191,28 @@ def mrr_arr_from_deals(
     time_range: TimeRange,
     pipeline_filter: str | None = None,
 ) -> dict:
-    """Extract MRR/ARR from deal properties (if populated)."""
+    """Extract MRR/ARR from deal properties, grouped by currency.
+
+    Returns a payload shaped as::
+
+        {
+            "by_currency": {
+                "USD": {"mrr": ..., "arr": ..., "deal_count": ...},
+                "JPY": {...},
+            },
+            "primary_currency": "USD",  # highest deal count, alphabetical tiebreak
+            # Back-compat flat fields (primary currency only) consumed
+            # by format_revenue_report's Recurring Revenue section:
+            "mrr": float,
+            "arr": float,
+            "deal_count": int,
+        }
+
+    Previously this summed ``hs_mrr`` and ``hs_arr`` across every
+    currency, producing a single misleading "$530K MRR" scalar on
+    JPY+USD portals. Recurring revenue is now reported per currency,
+    matching every other money metric in the skill.
+    """
     won = _fetch_won(
         deal_extractor,
         time_range,
@@ -196,16 +226,37 @@ def mrr_arr_from_deals(
             "pipeline",
             "hs_is_closed",
             "hs_is_closed_won",
+            "deal_currency_code",
         ],
     )
+    empty_payload = {
+        "by_currency": {},
+        "primary_currency": DEFAULT_CURRENCY,
+        "mrr": 0.0,
+        "arr": 0.0,
+        "deal_count": 0,
+    }
     if won.empty:
-        return {"mrr": 0.0, "arr": 0.0}
+        return empty_payload
 
+    won = _attach_currency(won)
     for col in ["hs_mrr", "hs_arr"]:
         won[col] = to_numeric_series(won, col)
 
+    by_currency: dict[str, dict] = {}
+    for code, group in won.groupby("currency"):
+        by_currency[str(code)] = {
+            "mrr": float(group["hs_mrr"].sum()),
+            "arr": float(group["hs_arr"].sum()),
+            "deal_count": int(len(group)),
+        }
+
+    primary = max(by_currency.items(), key=lambda kv: (kv[1]["deal_count"], kv[0]))[0]
+    primary_stats = by_currency[primary]
     return {
-        "mrr": won["hs_mrr"].sum(),
-        "arr": won["hs_arr"].sum(),
-        "deal_count": len(won),
+        "by_currency": by_currency,
+        "primary_currency": primary,
+        "mrr": primary_stats["mrr"],
+        "arr": primary_stats["arr"],
+        "deal_count": int(len(won)),
     }
