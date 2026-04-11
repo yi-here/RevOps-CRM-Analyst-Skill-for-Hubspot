@@ -679,12 +679,20 @@ def test_funnel_uses_count_only_search_bypassing_10k_cap():
 
     def _count_side_effect(filter_groups):
         filters = filter_groups[0]["filters"]
-        has_prop = next(
-            (f["propertyName"] for f in filters if f.get("operator") == "HAS_PROPERTY"),
+        # Stage filters use ``GTE "1"`` on a stage-date property (not
+        # HAS_PROPERTY — that operator triggers a 400 on HubSpot's
+        # contacts search endpoint for lifecycle-stage date columns).
+        stage_filter = next(
+            (
+                f for f in filters
+                if f.get("operator") == "GTE"
+                and f.get("propertyName", "").startswith("hs_lifecyclestage_")
+            ),
             None,
         )
-        if has_prop is None:
-            # Total contacts in range — deliberately above the 10k cap.
+        if stage_filter is None:
+            # No stage filter → total contacts in range. Deliberately
+            # above the 10k cap.
             return 50_000
         stage_totals = {
             "hs_lifecyclestage_lead_date": 40_000,
@@ -693,7 +701,7 @@ def test_funnel_uses_count_only_search_bypassing_10k_cap():
             "hs_lifecyclestage_opportunity_date": 1_500,
             "hs_lifecyclestage_customer_date": 500,
         }
-        return stage_totals[has_prop]
+        return stage_totals[stage_filter["propertyName"]]
 
     extractor.count.side_effect = _count_side_effect
 
@@ -733,6 +741,46 @@ def test_funnel_count_receives_createdate_range_on_every_call():
         prop_names = [f["propertyName"] for f in filters]
         assert prop_names.count("createdate") == 2, (
             "every count call must include both GTE and LTE createdate filters"
+        )
+
+
+def test_funnel_stage_filter_uses_gte_not_has_property():
+    """Regression: HubSpot's contacts search endpoint returns 400 when
+    a filter uses the ``HAS_PROPERTY`` operator on a lifecycle-stage
+    date column. Use ``GTE "1"`` instead — any real millisecond
+    timestamp is ≥ 1, so this matches every populated stage-date value
+    without tripping the server-side validation."""
+    extractor = MagicMock()
+    extractor.count.return_value = 100
+
+    conversion.funnel_conversion_rates(extractor, _tr())
+
+    # Collect every stage-property filter across all count() calls.
+    stage_filters = []
+    for call in extractor.count.call_args_list:
+        filter_groups = call.args[0] if call.args else call.kwargs["filter_groups"]
+        filters = filter_groups[0]["filters"]
+        for f in filters:
+            if f.get("propertyName", "").startswith("hs_lifecyclestage_"):
+                stage_filters.append(f)
+
+    # At least one stage filter was emitted (5 non-subscriber stages × 1
+    # call each = 5 filters).
+    assert len(stage_filters) == 5
+
+    # None of them may use HAS_PROPERTY — that's the bug we fixed.
+    for f in stage_filters:
+        assert f["operator"] != "HAS_PROPERTY", (
+            f"HubSpot rejects HAS_PROPERTY on contact lifecycle date "
+            f"properties with a 400: {f!r}"
+        )
+        # They must use GTE "1" (any populated timestamp).
+        assert f["operator"] == "GTE", (
+            f"expected GTE operator, got {f['operator']!r}"
+        )
+        assert f["value"] == "1", (
+            f"expected GTE \"1\" sentinel to match any populated "
+            f"timestamp, got {f['value']!r}"
         )
 
 

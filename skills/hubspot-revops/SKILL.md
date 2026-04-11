@@ -178,6 +178,41 @@ After generating a report, always:
 **Team:** Rep scorecard, win rate by rep, cycle length by rep, pipeline per rep  
 **Forecast:** Weighted pipeline, forecast categories, commit vs. best case  
 
+## Running multiple reports — cross-process rate limiting
+
+HubSpot's CRM API rate limits are **per portal**, not per process. The
+skill handles this with a cross-process token bucket backed by a JSON
+state file at `~/.hubspot_revops/rate_limit.general.state.json` (and a
+separate `rate_limit.search.state.json` for the stricter 5 req/s Search
+API bucket). Every HubSpotClient instance — across every parallel
+Python process — coordinates through those shared files via
+`fcntl.flock` exclusive locks, so launching several CLI invocations
+simultaneously no longer blows past HubSpot's ceiling.
+
+**Parallel invocation now works:**
+
+```bash
+# All four run in parallel; the shared bucket serializes their API
+# calls so the portal never sees more than 100 req/10s in aggregate.
+python -m hubspot_revops.cli report pipeline --period Q1-2026 &
+python -m hubspot_revops.cli report revenue  --period Q1-2026 &
+python -m hubspot_revops.cli report team     --period Q1-2026 &
+python -m hubspot_revops.cli report forecast --period Q1-2026 &
+wait
+```
+
+**Caveat:** parallel invocation doesn't make things faster — the
+shared bucket serializes API calls, so the total wall-clock time is
+roughly the same as running them sequentially. Parallelism is useful
+when you want independent processes (e.g. an agent loop that
+launches reports as tool calls) to not step on each other, not as a
+speedup.
+
+On Windows (no `fcntl`) or any environment where
+`~/.hubspot_revops/` isn't writable, the skill falls back to
+in-process rate limiting. In that fallback mode, **parallel
+invocation will 429** — run sequentially instead.
+
 ## Security
 
 - This skill is **read-only** — it never creates, updates, or deletes CRM data

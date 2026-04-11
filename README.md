@@ -566,9 +566,11 @@ HubSpot's Search API doesn't consistently honour the same date filter across eng
 
 `metrics/closed_lost.py` additionally warns when fewer than 50% of lost deals have a `closed_lost_reason` populated, because the reason breakdown is unreliable below that threshold.
 
-### 9. Rate Limiter with Separate Search-API Bucket
+### 9. Cross-Process Rate Limiter with Separate Search-API Bucket
 
-`client.py` runs two independent token buckets: 100 req/10s for the general CRM API and 5 req/1s for the Search API (which has stricter limits HubSpot doesn't document loudly). Paired with a 5-attempt exponential-backoff retry (1s → 2s → 4s → 8s → 16s) for 429/5xx, the client survives the contacts-search 502 spikes that crash naive wrappers.
+`client.py` runs two independent token buckets: 100 req/10s for the general CRM API and 5 req/1s for the Search API (which has stricter limits HubSpot doesn't document loudly). Both buckets persist state in JSON files under `~/.hubspot_revops/` and wrap every read-modify-write in an `fcntl.flock` exclusive lock, so **multiple parallel Python processes coordinate through shared buckets** instead of each running an independent limiter that collectively blows past HubSpot's per-portal ceiling. An agent loop that launches nine reports in parallel now serializes their API calls safely instead of triggering 429 cascades.
+
+Paired with a 5-attempt exponential-backoff retry (1s → 2s → 4s → 8s → 16s) for 429/5xx, the client survives the contacts-search 502 spikes that crash naive wrappers. On Windows (no `fcntl`) or any environment where `~/.hubspot_revops/` isn't writable, the skill falls back to the in-process limiter and emits a warning — parallel invocations in that fallback mode still need to run sequentially.
 
 ### 10. Atomic OAuth Token Cache
 
