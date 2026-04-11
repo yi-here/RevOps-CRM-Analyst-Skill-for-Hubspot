@@ -77,6 +77,45 @@ The two compose: pull a specific deal via HubSpot MCP, then invoke this
 skill's CLI for the deterministic quarter total. If HubSpot's MCP is not
 installed, fall back to this skill's CLI for everything.
 
+## Fallback Protocol — `FALLBACK_TO_MCP` banner
+
+When this skill **cannot confidently answer** a question, every CLI
+command emits a structured markdown banner containing the sentinel
+`FALLBACK_TO_MCP`. This happens in three cases:
+
+1. **No canned metric matches** — the user's question doesn't hit any
+   keyword in `nl_interface.REPORT_KEYWORDS`. Example: *"Which deals
+   mention our competitor Acme in the notes?"* — that needs a raw
+   records search, not an aggregate metric.
+2. **A report method crashes at runtime** — HubSpot returns a 5xx
+   after the retry policy exhausts, a schema mismatch surfaces, or a
+   transient network blip slips through. The CLI catches the
+   exception and emits the fallback banner with the error string.
+3. **An individual metric's graceful-degradation path triggers** —
+   e.g. `conversion.funnel_conversion_rates` returning an error
+   payload on contacts 502s.
+
+When you see `FALLBACK_TO_MCP` in a CLI output, **do not re-run the
+same CLI command**. Instead:
+
+1. Parse the original question from the banner (`**Original question:** "..."`)
+2. Pick the right HubSpot MCP tool:
+   - Record searches → `search_deals` / `search_contacts` / `search_companies`
+     with an appropriate `filter_groups` payload
+   - Single record → `get_deal` / `get_contact` / `get_company` by ID
+   - Activity timeline → `get_engagements`
+3. Run the raw query and synthesize the answer from the records you
+   get back. You are the LLM — this is where your reasoning replaces
+   the skill's deterministic aggregation.
+4. If HubSpot's MCP is not installed in the current host, install it
+   with `claude mcp add --transport http hubspot https://mcp.hubspot.com/anthropic`
+   and retry. If install fails, explain the limitation to the user and
+   offer to run a closely-related canned report instead.
+
+This protocol lets the skill stay opinionated about what it can answer
+deterministically, while gracefully handing off everything else to the
+MCP layer — the agent (you) decides which tool fits each question.
+
 ## Answering Questions
 
 When the user asks a business question, route it to the right report:

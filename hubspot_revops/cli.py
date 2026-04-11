@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from hubspot_revops.client import HubSpotClient
 from hubspot_revops.extractors.base import TimeRange
-from hubspot_revops.nl_interface import answer_question
+from hubspot_revops.nl_interface import answer_question, format_mcp_fallback
 from hubspot_revops.reports.generator import ReportGenerator
 from hubspot_revops.schema.cache import get_or_discover_schema
 
@@ -178,11 +178,35 @@ def main() -> None:
             "forecast": generator.forecast_report,
             "meetings": generator.meetings_report,
         }
-        print(reports[args.type](time_range=tr, pipeline_id=pipeline_arg))
+        # Runtime errors from any report (HubSpot 5xx after retry,
+        # unexpected schema shapes, etc.) are surfaced as the
+        # FALLBACK_TO_MCP banner instead of a Python traceback so the
+        # calling agent can hand off to HubSpot's MCP. Prerequisite
+        # failures (auth, schema discovery) still propagate because
+        # those cannot be routed to MCP either.
+        try:
+            print(reports[args.type](time_range=tr, pipeline_id=pipeline_arg))
+        except Exception as exc:
+            print(
+                format_mcp_fallback(
+                    f"{args.type} report"
+                    + (f" --period {args.period}" if getattr(args, "period", None) else "")
+                    + (f" --pipeline {pipeline_arg}" if pipeline_arg else ""),
+                    reason="runtime_error",
+                    attempted_report=args.type,
+                    error=str(exc),
+                )
+            )
+            sys.exit(2)
 
     elif args.command == "ask":
         tr = parse_time_range(getattr(args, "period", None))
         pipeline_arg = getattr(args, "pipeline", None)
+        # ``answer_question`` internally catches report errors and
+        # returns a FALLBACK_TO_MCP banner, so there's no try/except
+        # needed here. Classification failures (no keyword match) also
+        # route to the same banner rather than silently defaulting to
+        # the executive summary.
         print(
             answer_question(
                 args.question, generator, time_range=tr, pipeline_id=pipeline_arg
