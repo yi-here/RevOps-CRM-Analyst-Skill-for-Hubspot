@@ -78,10 +78,19 @@ def funnel_conversion_rates(
         return _empty_funnel()
 
     # Subscriber count == total contacts created in the range (anyone
-    # who entered HubSpot is at minimum a subscriber). Downstream stages
-    # are counted via HAS_PROPERTY on the stage-entry date, preserving
-    # the prior semantics: "contacts created in period who ever reached
-    # stage X".
+    # who entered HubSpot is at minimum a subscriber). Downstream
+    # stages are counted via a ``GTE "1"`` filter on the stage-entry
+    # date column, preserving the prior semantics: "contacts created
+    # in period who ever reached stage X".
+    #
+    # The natural operator here would be ``HAS_PROPERTY``, but HubSpot
+    # rejects the search request with a 400 Bad Request when we use
+    # it against contact lifecycle-stage date properties (observed on
+    # live portals — the exact subset of properties where
+    # ``HAS_PROPERTY`` is rejected is undocumented). ``GTE "1"``
+    # reliably matches any populated timestamp — a real lifecycle
+    # date is always ≥ 1 millisecond since epoch — and works on
+    # every date property without triggering the 400.
     stage_counts: dict[str, int] = {"subscriber": total_contacts}
     for stage in LIFECYCLE_STAGES:
         if stage == "subscriber":
@@ -91,7 +100,7 @@ def funnel_conversion_rates(
             continue
         try:
             stage_counts[stage] = _count(
-                [{"propertyName": date_prop, "operator": "HAS_PROPERTY"}]
+                [{"propertyName": date_prop, "operator": "GTE", "value": "1"}]
             )
         except Exception as exc:
             log.warning(

@@ -178,6 +178,31 @@ After generating a report, always:
 **Team:** Rep scorecard, win rate by rep, cycle length by rep, pipeline per rep  
 **Forecast:** Weighted pipeline, forecast categories, commit vs. best case  
 
+## Running multiple reports — run them sequentially, not in parallel
+
+HubSpot's CRM API rate limits are **per portal**, not per process. The
+skill's token-bucket rate limiter lives inside the current Python
+process, so launching several CLI invocations in parallel (one per
+report) gives every process its own independent limiter and they
+collectively blow past HubSpot's ceiling, triggering 429 responses that
+exhaust the retry policy and surface as `FALLBACK_TO_MCP` banners on
+the later reports in the batch.
+
+**Run reports sequentially instead:**
+
+```bash
+# Good — one at a time
+python -m hubspot_revops.cli report pipeline --period Q1-2026
+python -m hubspot_revops.cli report revenue  --period Q1-2026
+python -m hubspot_revops.cli report team     --period Q1-2026
+python -m hubspot_revops.cli report forecast --period Q1-2026
+```
+
+Do **not** background nine CLI commands with `&` or launch them in
+parallel from an agent loop. If you need a multi-report batch, invoke
+them one after the other — each report is already internally
+parallelism-free and respects the rate limiter within its own process.
+
 ## Security
 
 - This skill is **read-only** — it never creates, updates, or deletes CRM data
