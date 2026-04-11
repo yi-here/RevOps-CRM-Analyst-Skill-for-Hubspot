@@ -92,12 +92,19 @@ But MCP alone is a **data access layer** — it gives the model tools to fetch r
 | **Report structure** | Varies per query — columns drift between runs | Locked templates — week-over-week comparison works |
 | **Interpretation** | Optional, depends on how the user phrased the question | Mandatory: insights → risks → actions → drill-downs |
 | **Write safety** | Exposes HubSpot's write endpoints — `crm_update_*`, `crm_delete_*` | Architecturally read-only — write code doesn't exist in the package |
-| **Host reach** | Any MCP-compatible host (Claude Code, Cursor, Zed, Desktop) | Claude Code + Python CLI today; MCP wrapper on the roadmap |
+| **Host reach** | Any MCP-compatible host (Claude Code, Cursor, Zed, Desktop) | Claude Code + Python CLI; automatically hands off unmatched questions to HubSpot's MCP via a `FALLBACK_TO_MCP` banner |
 | **Best for** | Freeform queries, cross-tool composition, small portals where exact numbers don't matter | Canned RevOps reports, audit-grade precision, medium-large portals, scheduled "Monday pipeline review" workflows |
 
-### They compose — you can install both
+### They compose — and the skill already falls back to MCP today
 
-This skill and HubSpot's MCP aren't competitors. MCP is the **transport layer**; this skill is the **opinion layer**. A future version of this skill will ship an MCP wrapper that calls HubSpot's MCP for raw data under the hood and layers the deterministic metric engines + report templates on top. Users who want raw CRM exploration install the HubSpot MCP. Users who want analyst-grade reporting install this skill. Users who want both install both — they don't conflict.
+This skill and HubSpot's MCP aren't competitors — they're layered. Users who want raw CRM exploration install the HubSpot MCP. Users who want analyst-grade reporting install this skill. Users who want both install both; they don't conflict.
+
+**How the fallback works right now (not a future roadmap item):**
+
+- **Primary path — raw queries.** The skill talks directly to HubSpot's REST API via `hubspot-api-client` (Search API with filters, paginated via `after` cursor). MCP is *not* in the hot path for canned reports. This is what makes the numbers deterministic and byte-exact — no model-in-the-loop between you and the aggregation.
+- **Fallback path — hand off to MCP.** When `python -m hubspot_revops.cli ask "..."` hits a question that doesn't match any canned-metric keyword, or when a report method raises an exception (HubSpot 5xx after retry, unexpected schema shape, etc.), the skill does *not* silently route to the executive summary and it does *not* spew a Python traceback. It emits a structured `FALLBACK_TO_MCP` markdown banner — see `hubspot_revops/nl_interface.py:130` — that tells the calling agent: "I couldn't answer this deterministically; here's the original question, here are the HubSpot MCP tools to try (`search_deals`, `search_contacts`, `get_engagements`, …), and here's the install command if the MCP isn't present."
+
+The net effect: **for the 40+ questions this skill was designed to answer, you get raw-query precision; for everything else, the skill knows it doesn't know, and the agent hands the question off to HubSpot's MCP for a raw-records lookup instead of making something up.** That's the "compose" story — not a wrapper, a graceful handoff.
 
 ### When to reach for which
 
