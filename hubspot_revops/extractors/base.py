@@ -89,6 +89,26 @@ class BaseExtractor:
             limit=limit,
         )
 
+    def count(self, filter_groups: list[dict]) -> int:
+        """Count matching objects without paginating the full result set.
+
+        Issues a single ``limit=1`` search and reads ``response.total``
+        from the first page. This sidesteps the HubSpot CRM Search API's
+        10,000-result pagination cap — large portals (e.g. 50k new
+        contacts in a quarter) previously had their funnel counts
+        silently clipped to 10k because ``search()`` walked the
+        ``after`` cursor and exited when the cap was hit. Count-only
+        queries do not paginate, so the underlying cap does not apply.
+        """
+        response = self.client.search_objects(
+            object_type=self.object_type,
+            filter_groups=filter_groups,
+            properties=[],  # minimal payload — we only want metadata
+            limit=1,
+        )
+        total = getattr(response, "total", None)
+        return int(total) if total is not None else 0
+
     def get_associated_ids(self, object_ids: list[str], to_type: str) -> dict[str, list[str]]:
         """Get associated object IDs for a list of source objects."""
         if not object_ids:

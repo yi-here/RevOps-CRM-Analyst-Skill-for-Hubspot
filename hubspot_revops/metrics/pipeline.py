@@ -11,6 +11,8 @@ from hubspot_revops.extractors.deals import DealExtractor
 from hubspot_revops.metrics._utils import to_bool_series, to_numeric_series
 from hubspot_revops.schema.models import CRMSchema
 
+DEFAULT_CURRENCY = "USD"
+
 
 def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFrame:
     if pipeline_filter and not df.empty and "pipeline" in df.columns:
@@ -18,19 +20,86 @@ def _filter_pipeline(df: pd.DataFrame, pipeline_filter: str | None) -> pd.DataFr
     return df
 
 
+def _attach_currency(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a normalized ``currency`` column, defaulting to USD.
+
+    Mirrors ``revenue._attach_currency`` so open-pipeline metrics bucket
+    the same way closed-revenue metrics do — multi-currency portals must
+    never sum ¥ and $ into the same scalar.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    if "deal_currency_code" in df.columns:
+        df["currency"] = (
+            df["deal_currency_code"]
+            .fillna(DEFAULT_CURRENCY)
+            .replace("", DEFAULT_CURRENCY)
+        )
+    else:
+        df["currency"] = DEFAULT_CURRENCY
+    return df
+
+
 def total_pipeline_value(
     deal_extractor: DealExtractor, pipeline_filter: str | None = None
 ) -> dict:
-    """Calculate total open pipeline value."""
-    df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
-    if df.empty:
-        return {"total_deals": 0, "total_value": 0.0}
+    """Calculate total open pipeline value, grouped by currency.
 
+    Returns a payload shaped as::
+
+        {
+            "by_currency": {
+                "USD": {"total_value": ..., "deal_count": ..., "avg_deal_size": ...},
+                "JPY": {...},
+            },
+            "primary_currency": "USD",  # highest deal count, alphabetical tiebreak
+            "total_deals": int,
+            # Back-compat / primary-currency convenience fields consumed by
+            # pipeline_velocity() and the report templates:
+            "total_value": float,
+            "avg_deal_size": float,
+        }
+
+    Previously this summed every open deal amount into a single scalar,
+    which silently inflated multi-currency portals — a ¥990K deal was
+    being counted as $990K of pipeline. Every caller now sees per-currency
+    subtotals; the back-compat top-level fields reflect only the primary
+    (highest-count) currency.
+    """
+    df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
+    empty_payload = {
+        "by_currency": {},
+        "primary_currency": DEFAULT_CURRENCY,
+        "total_deals": 0,
+        "total_value": 0.0,
+        "avg_deal_size": 0.0,
+    }
+    if df.empty:
+        return empty_payload
+
+    df = _attach_currency(df)
     df["amount"] = to_numeric_series(df, "amount")
+
+    by_currency: dict[str, dict] = {}
+    for code, group in df.groupby("currency"):
+        amounts = group["amount"]
+        by_currency[str(code)] = {
+            "total_value": float(amounts.sum()),
+            "deal_count": int(len(group)),
+            "avg_deal_size": float(amounts.mean()) if len(group) else 0.0,
+        }
+
+    # Primary currency = highest deal count. Ties are broken alphabetically
+    # for determinism (matches revenue.closed_revenue's choice function).
+    primary = max(by_currency.items(), key=lambda kv: (kv[1]["deal_count"], kv[0]))[0]
+    primary_stats = by_currency[primary]
     return {
-        "total_deals": len(df),
-        "total_value": df["amount"].sum(),
-        "avg_deal_size": df["amount"].mean(),
+        "by_currency": by_currency,
+        "primary_currency": primary,
+        "total_deals": int(len(df)),
+        "total_value": primary_stats["total_value"],
+        "avg_deal_size": primary_stats["avg_deal_size"],
     }
 
 

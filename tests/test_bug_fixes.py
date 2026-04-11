@@ -19,6 +19,7 @@ from hubspot_revops.metrics import (
     conversion,
     forecast_bucket,
     meeting_history,
+    pipeline,
     revenue,
     team,
 )
@@ -41,9 +42,14 @@ def _owners():
 
 
 def test_funnel_returns_error_payload_on_contacts_failure():
-    """Contacts search raising must not crash funnel_conversion_rates."""
+    """Contacts count raising must not crash funnel_conversion_rates.
+
+    The funnel now uses ``contact_extractor.count()`` (count-only search)
+    instead of fetching full records, so the 502 fallback hooks into
+    ``count`` rather than ``get_new_contacts``.
+    """
     extractor = MagicMock()
-    extractor.get_new_contacts.side_effect = Exception("502 Bad Gateway")
+    extractor.count.side_effect = Exception("502 Bad Gateway")
 
     result = conversion.funnel_conversion_rates(extractor, _tr())
     assert result["total_contacts"] == 0
@@ -499,3 +505,269 @@ def test_team_and_revenue_agree_on_won_totals_with_capitalized_boolean():
     )
 
     assert team_total == rev_total == rev_by_owner_total == 151_300
+
+
+# ---------------------------------------------------------------------------
+# Third bug-fix pass — three active bugs in the current GitHub code.
+# ---------------------------------------------------------------------------
+
+
+# --- Bug 9: activity SDK call missing object_type --------------------------
+#
+# ``client.search_objects("meetings", ...)`` used to fall through to the
+# generic ``self.api.crm.objects.search_api.do_search`` with only the
+# search request as a kwarg — but the generic endpoint requires
+# ``object_type`` as a first positional argument, so every activity
+# report crashed with ``TypeError: do_search() missing 1 required
+# positional argument: 'object_type'``.
+
+
+def test_search_objects_passes_object_type_for_generic_objects_api():
+    """Activities route through ``crm.objects.search_api.do_search`` and
+    must pass ``object_type`` as a positional argument."""
+    from hubspot_revops.client import HubSpotClient
+
+    client = HubSpotClient(access_token="test-token")
+    mock_api = MagicMock()
+    client.api = mock_api
+
+    client.search_objects(
+        object_type="meetings",
+        filter_groups=[{"filters": []}],
+        properties=["hs_timestamp"],
+    )
+
+    do_search = mock_api.crm.objects.search_api.do_search
+    assert do_search.called, "generic objects search_api was never called"
+    call = do_search.call_args
+    # Positional args MUST include the object_type string.
+    assert call.args == ("meetings",), (
+        f"expected ('meetings',) positional args, got {call.args!r}"
+    )
+    assert "public_object_search_request" in call.kwargs
+
+
+def test_search_objects_omits_object_type_for_typed_search_api():
+    """Typed namespaces (contacts, deals, companies) already know their
+    object type — passing it positionally would raise TypeError."""
+    from hubspot_revops.client import HubSpotClient
+
+    client = HubSpotClient(access_token="test-token")
+    mock_api = MagicMock()
+    client.api = mock_api
+
+    client.search_objects(
+        object_type="contacts",
+        filter_groups=[{"filters": []}],
+        properties=["email"],
+    )
+
+    do_search = mock_api.crm.contacts.search_api.do_search
+    assert do_search.called
+    call = do_search.call_args
+    assert call.args == (), (
+        f"typed search_api.do_search must not receive positional args, "
+        f"got {call.args!r}"
+    )
+    assert "public_object_search_request" in call.kwargs
+
+
+def test_search_objects_routes_custom_objects_through_generic_api():
+    """Custom object types aren't in ``_sdk_module``'s mapping either,
+    so they also hit the generic endpoint and need ``object_type``."""
+    from hubspot_revops.client import HubSpotClient
+
+    client = HubSpotClient(access_token="test-token")
+    mock_api = MagicMock()
+    client.api = mock_api
+
+    client.search_objects(
+        object_type="p1234567_orders",  # arbitrary custom object type
+        filter_groups=[{"filters": []}],
+    )
+
+    do_search = mock_api.crm.objects.search_api.do_search
+    assert do_search.call_args.args == ("p1234567_orders",)
+
+
+# --- Bug 10: pipeline currency mixing in total_pipeline_value --------------
+#
+# ``pipeline.total_pipeline_value`` used to sum every open-deal amount
+# into a single scalar regardless of ``deal_currency_code``. On a portal
+# with JPY + USD deals a ¥990K deal was being reported as $990K of
+# pipeline, silently inflating the total by the JPY→USD FX mismatch.
+
+
+def test_total_pipeline_value_separates_jpy_and_usd():
+    """Multi-currency open deals must bucket by currency and never sum
+    into a single mixed scalar."""
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["990000", "5000", "3000"],
+        "dealstage": ["qualified", "demo", "proposal"],
+        "pipeline": ["japan", "default", "default"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+    })
+
+    result = pipeline.total_pipeline_value(extractor)
+
+    assert result["total_deals"] == 3
+    assert set(result["by_currency"].keys()) == {"JPY", "USD"}
+    assert result["by_currency"]["JPY"]["total_value"] == 990_000
+    assert result["by_currency"]["JPY"]["deal_count"] == 1
+    assert result["by_currency"]["JPY"]["avg_deal_size"] == 990_000
+    assert result["by_currency"]["USD"]["total_value"] == 8_000
+    assert result["by_currency"]["USD"]["deal_count"] == 2
+    assert result["by_currency"]["USD"]["avg_deal_size"] == 4_000
+    # Primary currency = whichever has the most deals (USD: 2).
+    assert result["primary_currency"] == "USD"
+    # Back-compat flat field reflects ONLY the primary currency, never a
+    # cross-currency sum.
+    assert result["total_value"] == 8_000
+    assert result["avg_deal_size"] == 4_000
+
+
+def test_total_pipeline_value_no_currency_column_defaults_to_usd():
+    """Portals without a ``deal_currency_code`` property still work and
+    produce a single-currency USD payload (back-compat with old tests)."""
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["10000", "20000", "30000"],
+        "dealstage": ["qualified", "demo", "proposal"],
+    })
+
+    result = pipeline.total_pipeline_value(extractor)
+    assert result["total_deals"] == 3
+    assert result["total_value"] == 60_000
+    assert result["avg_deal_size"] == 20_000
+    assert result["primary_currency"] == "USD"
+    assert result["by_currency"]["USD"]["total_value"] == 60_000
+
+
+def test_total_pipeline_value_empty_payload_shape():
+    """Empty extractor must return every key callers rely on, not the
+    old ``{total_deals, total_value}`` pair — pipeline_velocity() and
+    the templates expect ``avg_deal_size`` and ``by_currency`` keys too."""
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame()
+
+    result = pipeline.total_pipeline_value(extractor)
+    assert result["total_deals"] == 0
+    assert result["total_value"] == 0.0
+    assert result["avg_deal_size"] == 0.0
+    assert result["by_currency"] == {}
+    assert result["primary_currency"] == "USD"
+
+
+# --- Bug 11: funnel contact 10K cap ----------------------------------------
+#
+# ``conversion.funnel_conversion_rates`` used to fetch every matching
+# contact via ``contact_extractor.get_new_contacts``, which walks the
+# ``after`` cursor up to the HubSpot Search API's 10,000-result hard
+# cap. Portals with more than 10k new contacts in a period had every
+# stage count silently clipped to whatever fit in the first 10k page.
+# The fix switches to a count-only search (limit=1, response.total),
+# which bypasses the pagination cap entirely.
+
+
+def test_funnel_uses_count_only_search_bypassing_10k_cap():
+    """50k contacts in range must be reported as 50k, not clipped to 10k."""
+    extractor = MagicMock()
+
+    def _count_side_effect(filter_groups):
+        filters = filter_groups[0]["filters"]
+        has_prop = next(
+            (f["propertyName"] for f in filters if f.get("operator") == "HAS_PROPERTY"),
+            None,
+        )
+        if has_prop is None:
+            # Total contacts in range — deliberately above the 10k cap.
+            return 50_000
+        stage_totals = {
+            "hs_lifecyclestage_lead_date": 40_000,
+            "hs_lifecyclestage_marketingqualifiedlead_date": 12_000,
+            "hs_lifecyclestage_salesqualifiedlead_date": 4_000,
+            "hs_lifecyclestage_opportunity_date": 1_500,
+            "hs_lifecyclestage_customer_date": 500,
+        }
+        return stage_totals[has_prop]
+
+    extractor.count.side_effect = _count_side_effect
+
+    result = conversion.funnel_conversion_rates(extractor, _tr())
+
+    # Every stage count is the true total, not clipped to 10k.
+    assert result["total_contacts"] == 50_000
+    assert result["stages"]["subscriber"] == 50_000
+    assert result["stages"]["lead"] == 40_000
+    assert result["stages"]["marketingqualifiedlead"] == 12_000
+    assert result["stages"]["salesqualifiedlead"] == 4_000
+    assert result["stages"]["opportunity"] == 1_500
+    assert result["stages"]["customer"] == 500
+    # Step-wise conversion uses the uncapped totals.
+    lead_to_mql = result["conversions"]["lead_to_marketingqualifiedlead"]
+    assert lead_to_mql["from_count"] == 40_000
+    assert lead_to_mql["to_count"] == 12_000
+    assert lead_to_mql["conversion_rate"] == 30.0
+    # Must NOT fall back to the paginated fetch that has the cap.
+    extractor.get_new_contacts.assert_not_called()
+
+
+def test_funnel_count_receives_createdate_range_on_every_call():
+    """Every count() call must include the createdate time-range filter;
+    otherwise stage totals span the entire portal history instead of the
+    requested period."""
+    extractor = MagicMock()
+    extractor.count.return_value = 0
+
+    tr = _tr()
+    conversion.funnel_conversion_rates(extractor, tr)
+
+    assert extractor.count.call_count >= 1
+    for call in extractor.count.call_args_list:
+        filter_groups = call.args[0] if call.args else call.kwargs["filter_groups"]
+        filters = filter_groups[0]["filters"]
+        prop_names = [f["propertyName"] for f in filters]
+        assert prop_names.count("createdate") == 2, (
+            "every count call must include both GTE and LTE createdate filters"
+        )
+
+
+def test_base_extractor_count_reads_response_total():
+    """BaseExtractor.count must use limit=1 (no pagination) and return
+    response.total as an int."""
+    from types import SimpleNamespace
+
+    from hubspot_revops.extractors.base import BaseExtractor
+
+    client = MagicMock()
+    client.search_objects.return_value = SimpleNamespace(total=50_000)
+
+    extractor = BaseExtractor(client)
+    extractor.object_type = "contacts"
+
+    count = extractor.count([{"filters": []}])
+    assert count == 50_000
+
+    # Verify the call used limit=1, not 10000.
+    kwargs = client.search_objects.call_args.kwargs
+    assert kwargs["limit"] == 1
+    assert kwargs["object_type"] == "contacts"
+
+
+def test_base_extractor_count_missing_total_returns_zero():
+    """If the SDK ever returns a response without a ``total`` attribute,
+    count should return 0 rather than crash."""
+    from types import SimpleNamespace
+
+    from hubspot_revops.extractors.base import BaseExtractor
+
+    client = MagicMock()
+    client.search_objects.return_value = SimpleNamespace()  # no .total
+
+    extractor = BaseExtractor(client)
+    extractor.object_type = "contacts"
+
+    assert extractor.count([{"filters": []}]) == 0

@@ -43,28 +43,61 @@ def funnel_conversion_rates(
 ) -> dict:
     """Calculate conversion rates between lifecycle stages.
 
+    Uses count-only searches (``limit=1``, reads ``response.total``)
+    rather than fetching every matching contact. The HubSpot CRM Search
+    API hard-caps result pagination at 10,000 records — on a portal
+    with more than 10k new contacts in a period the old implementation
+    silently clipped every downstream stage count to whatever it could
+    fit in the first 10k, producing wildly under-stated conversion
+    rates. ``BaseExtractor.count()`` reads the response metadata and
+    never walks the ``after`` cursor, so the cap does not apply.
+
     Returns a ``{"error": ...}`` payload rather than raising when the
     contacts search API is unreachable — the HubSpot contacts endpoint
     occasionally returns 502s under load and the client's retry policy
-    only covers transient blips, not sustained outages. The funnel report
-    renders a banner instead of crashing the whole command.
+    only covers transient blips, not sustained outages. The funnel
+    report renders a banner instead of crashing the whole command.
     """
+    time_filters = [
+        {"propertyName": "createdate", "operator": "GTE", "value": time_range.start_ms},
+        {"propertyName": "createdate", "operator": "LTE", "value": time_range.end_ms},
+    ]
+
+    def _count(extra_filters: list[dict]) -> int:
+        return contact_extractor.count(
+            [{"filters": time_filters + extra_filters}]
+        )
+
     try:
-        contacts = contact_extractor.get_new_contacts(time_range)
+        total_contacts = _count([])
     except Exception as exc:
-        log.warning("contacts search failed in funnel_conversion_rates: %s", exc)
+        log.warning("contacts count failed in funnel_conversion_rates: %s", exc)
         return _empty_funnel(error=str(exc))
-    if contacts.empty:
+
+    if total_contacts == 0:
         return _empty_funnel()
 
-    stage_counts = {}
+    # Subscriber count == total contacts created in the range (anyone
+    # who entered HubSpot is at minimum a subscriber). Downstream stages
+    # are counted via HAS_PROPERTY on the stage-entry date, preserving
+    # the prior semantics: "contacts created in period who ever reached
+    # stage X".
+    stage_counts: dict[str, int] = {"subscriber": total_contacts}
     for stage in LIFECYCLE_STAGES:
+        if stage == "subscriber":
+            continue
         date_prop = STAGE_DATE_PROPERTIES.get(stage)
-        if date_prop and date_prop in contacts.columns:
-            reached = contacts[contacts[date_prop].notna()]
-            stage_counts[stage] = len(reached)
-        elif stage == "subscriber":
-            stage_counts[stage] = len(contacts)
+        if not date_prop:
+            continue
+        try:
+            stage_counts[stage] = _count(
+                [{"propertyName": date_prop, "operator": "HAS_PROPERTY"}]
+            )
+        except Exception as exc:
+            log.warning(
+                "contacts count failed for stage %s: %s", stage, exc
+            )
+            return _empty_funnel(error=str(exc))
 
     # Calculate step-wise conversion rates
     conversions = {}
@@ -84,7 +117,7 @@ def funnel_conversion_rates(
     return {
         "stages": stage_counts,
         "conversions": conversions,
-        "total_contacts": len(contacts),
+        "total_contacts": total_contacts,
     }
 
 

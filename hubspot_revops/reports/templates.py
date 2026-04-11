@@ -71,13 +71,28 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
     else:
         revenue_lines = _fmt_currency(rev.get("total_revenue", 0))
 
+    # Same multi-currency treatment for the open pipeline snapshot —
+    # previously the "Open Pipeline" row summed ¥ and $ into a single
+    # scalar, silently inflating multi-currency portal totals. When only
+    # one currency is present the output matches the old single-line
+    # format (falls back to the primary-currency scalar).
+    open_by_currency = p.get("by_currency") or {}
+    if len(open_by_currency) > 1:
+        pipeline_lines = "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats['total_value'], code)} "
+            f"({int(stats['deal_count'])} deals)"
+            for code, stats in sorted(open_by_currency.items())
+        )
+    else:
+        pipeline_lines = _fmt_currency(p.get("total_value", 0))
+
     return f"""# Executive Summary
 **Period:** {_period_str(tr)}
 
 ## Pipeline
 | Metric | Value |
 |---|---|
-| Open Pipeline | {_fmt_currency(p['total_value'])} |
+| Open Pipeline | {pipeline_lines} |
 | Open Deals | {p['total_deals']} |
 | Weighted Pipeline | {_fmt_currency(wt['weighted_value'])} |
 | Avg Deal Size | {_fmt_currency(p.get('avg_deal_size', 0))} |
@@ -113,8 +128,33 @@ def format_pipeline_report(data: dict, tr: TimeRange) -> str:
         f"**Open pipeline snapshot:** as of {snapshot_ts} "
         f"(`--period` does not affect open-deal totals — HubSpot does not "
         f"expose historical pipeline state)\n",
-        f"**Total Open Pipeline:** {_fmt_currency(total['total_value'])} ({total['total_deals']} deals)\n",
     ]
+
+    # Multi-currency portals get a per-currency breakdown so ¥ and $
+    # are never summed into a single misleading scalar. Single-currency
+    # portals render as the old "Total Open Pipeline: $X (N deals)" line.
+    by_currency = total.get("by_currency") or {}
+    if len(by_currency) > 1:
+        lines.append(f"**Total Open Pipeline:** {total['total_deals']} deals\n")
+        lines.append("| Currency | Value | Deals | Avg Size |")
+        lines.append("|---|---|---|---|")
+        for code in sorted(by_currency.keys()):
+            stats = by_currency[code]
+            lines.append(
+                f"| {code} "
+                f"| {_fmt_currency_with_code(stats['total_value'], code)} "
+                f"| {int(stats['deal_count'])} "
+                f"| {_fmt_currency_with_code(stats['avg_deal_size'], code)} |"
+            )
+        lines.append(
+            "\n> Multi-currency open pipeline is reported separately — "
+            "JPY and USD amounts are never summed.\n"
+        )
+    else:
+        lines.append(
+            f"**Total Open Pipeline:** {_fmt_currency(total['total_value'])} "
+            f"({total['total_deals']} deals)\n"
+        )
 
     by_stage = data["by_stage"]
     if not isinstance(by_stage, pd.DataFrame) or by_stage.empty:
