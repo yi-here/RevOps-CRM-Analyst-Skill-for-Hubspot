@@ -104,6 +104,18 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
     else:
         ads_avg_lines = _fmt_currency(ads.get("avg_deal_size", 0))
 
+    # Weighted pipeline (stage-probability-weighted) — bucket by currency
+    # for the same reason. The stage-probability multiplication is
+    # dimensionless so summing across currencies produces nonsense.
+    wt_by_currency = wt.get("by_currency") or {}
+    if len(wt_by_currency) > 1:
+        weighted_lines = "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats['weighted_value'], code)}"
+            for code, stats in sorted(wt_by_currency.items())
+        )
+    else:
+        weighted_lines = _fmt_currency(wt.get("weighted_value", 0))
+
     return f"""# Executive Summary
 **Period:** {_period_str(tr)}
 
@@ -112,7 +124,7 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
 |---|---|
 | Open Pipeline | {pipeline_lines} |
 | Open Deals | {p['total_deals']} |
-| Weighted Pipeline | {_fmt_currency(wt['weighted_value'])} |
+| Weighted Pipeline | {weighted_lines} |
 | Avg Deal Size | {open_avg_lines} |
 
 ## Performance
@@ -179,15 +191,34 @@ def format_pipeline_report(data: dict, tr: TimeRange) -> str:
         lines.append("_No stage breakdown available._\n")
     else:
         lines.append("## By Stage\n")
-        lines.append("| Stage | Deals | Value | Avg Size |")
-        lines.append("|---|---|---|---|")
-        for _, row in by_stage.iterrows():
-            lines.append(
-                f"| {row.get('stage_label', row.get('dealstage', 'N/A'))} "
-                f"| {int(row['deal_count'])} "
-                f"| {_fmt_currency(row['total_value'])} "
-                f"| {_fmt_currency(row['avg_value'])} |"
-            )
+        # The DataFrame now includes a ``currency`` column so mixed-
+        # currency stages render as separate rows. A ``Proposal`` stage
+        # containing a ¥1M deal and a $50K deal emits two rows instead
+        # of one silently-mixed average. Fall back to USD if the column
+        # is missing (e.g. older callers).
+        has_currency = "currency" in by_stage.columns
+        if has_currency:
+            lines.append("| Stage | Currency | Deals | Value | Avg Size |")
+            lines.append("|---|---|---|---|---|")
+            for _, row in by_stage.iterrows():
+                code = row.get("currency", "USD") or "USD"
+                lines.append(
+                    f"| {row.get('stage_label', row.get('dealstage', 'N/A'))} "
+                    f"| {code} "
+                    f"| {int(row['deal_count'])} "
+                    f"| {_fmt_currency_with_code(row['total_value'], code)} "
+                    f"| {_fmt_currency_with_code(row['avg_value'], code)} |"
+                )
+        else:
+            lines.append("| Stage | Deals | Value | Avg Size |")
+            lines.append("|---|---|---|---|")
+            for _, row in by_stage.iterrows():
+                lines.append(
+                    f"| {row.get('stage_label', row.get('dealstage', 'N/A'))} "
+                    f"| {int(row['deal_count'])} "
+                    f"| {_fmt_currency(row['total_value'])} "
+                    f"| {_fmt_currency(row['avg_value'])} |"
+                )
 
     lines.extend([
         f"\n## Period Metrics ({_period_str(tr)})\n",
@@ -231,7 +262,30 @@ def format_revenue_report(data: dict, tr: TimeRange) -> str:
                 "USD amounts are never summed."
             )
 
-    if mrr["mrr"] > 0 or mrr["arr"] > 0:
+    mrr_by_currency = mrr.get("by_currency") or {}
+    if mrr_by_currency and any(
+        stats["mrr"] > 0 or stats["arr"] > 0 for stats in mrr_by_currency.values()
+    ):
+        lines.append("\n## Recurring Revenue\n")
+        if len(mrr_by_currency) > 1:
+            # Per-currency table so ¥ MRR and $ MRR are never summed.
+            lines.append("| Currency | MRR | ARR | Deals |")
+            lines.append("|---|---|---|---|")
+            for code in sorted(mrr_by_currency.keys()):
+                stats = mrr_by_currency[code]
+                lines.append(
+                    f"| {code} "
+                    f"| {_fmt_currency_with_code(stats['mrr'], code)} "
+                    f"| {_fmt_currency_with_code(stats['arr'], code)} "
+                    f"| {int(stats['deal_count'])} |"
+                )
+        else:
+            lines.extend([
+                f"- **MRR:** {_fmt_currency(mrr['mrr'])}",
+                f"- **ARR:** {_fmt_currency(mrr['arr'])}",
+            ])
+    elif mrr.get("mrr", 0) > 0 or mrr.get("arr", 0) > 0:
+        # Back-compat: some callers may still pass the pre-multicurrency shape.
         lines.extend([
             f"\n## Recurring Revenue\n",
             f"- **MRR:** {_fmt_currency(mrr['mrr'])}",

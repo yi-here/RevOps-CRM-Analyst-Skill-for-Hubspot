@@ -136,24 +136,38 @@ def pipeline_by_stage(
     schema: CRMSchema,
     pipeline_filter: str | None = None,
 ) -> pd.DataFrame:
-    """Break down open pipeline by stage (pipeline-aware, no label collisions)."""
+    """Break down open pipeline by stage, pipeline-aware AND currency-aware.
+
+    Returns one row per ``(pipeline, dealstage, currency)`` tuple so
+    mixed-currency stages never collapse into a single misleading total.
+    A "Proposal" stage containing a ¥1M deal and a $50K deal used to
+    render as "Proposal: $525K avg" — now it produces two separate rows
+    (``Proposal (Sales) / JPY / ¥1M`` and ``Proposal (Sales) / USD / $50K``).
+
+    Stages can share labels across pipelines ("Qualified" in both Sales
+    and Japan), so we disambiguate by joining on ``(pipeline_id,
+    stage_id)`` and include the pipeline label in the rendered
+    ``stage_label`` to keep them distinct.
+    """
     df = _filter_pipeline(deal_extractor.get_open_deals(), pipeline_filter)
     if df.empty:
         return pd.DataFrame()
 
+    df = _attach_currency(df)
     df["amount"] = to_numeric_series(df, "amount")
 
     # Build a (pipeline_id, stage_id) -> (stage_label, pipeline_label) map.
-    # Stages can share labels across pipelines ("Qualified" in both Sales and
-    # Japan), so we disambiguate by joining on both keys and include the
-    # pipeline label in the output row to keep them distinct.
     stage_info: dict[tuple[str, str], tuple[str, str]] = {}
     for pipelines in schema.pipelines.values():
         for pl in pipelines:
             for s in pl.stages:
                 stage_info[(pl.pipeline_id, s.stage_id)] = (s.label, pl.label)
 
-    group_cols = ["pipeline", "dealstage"] if "pipeline" in df.columns else ["dealstage"]
+    group_cols = (
+        ["pipeline", "dealstage", "currency"]
+        if "pipeline" in df.columns
+        else ["dealstage", "currency"]
+    )
     grouped = df.groupby(group_cols).agg(
         deal_count=("id", "count"),
         total_value=("amount", "sum"),
@@ -172,7 +186,9 @@ def pipeline_by_stage(
 
     grouped["stage_label"] = grouped.apply(_lookup_label, axis=1)
     grouped["pipeline_label"] = grouped.apply(_lookup_pipeline_label, axis=1)
-    return grouped.sort_values("total_value", ascending=False)
+    return grouped.sort_values(
+        ["currency", "total_value"], ascending=[True, False]
+    ).reset_index(drop=True)
 
 
 def win_rate(

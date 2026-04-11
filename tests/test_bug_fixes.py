@@ -17,6 +17,7 @@ from hubspot_revops.extractors.owners import get_owners
 from hubspot_revops.metrics import (
     closed_lost,
     conversion,
+    forecast,
     forecast_bucket,
     meeting_history,
     pipeline,
@@ -987,3 +988,305 @@ def test_pipeline_velocity_reads_back_compat_avg_deal_size():
     assert result["avg_deal_size"] == 50_000
     assert result["open_deals"] == 2
     assert result["win_rate"] == 75.0  # 3W / 1L across all currencies
+
+
+# ---------------------------------------------------------------------------
+# Fourth bug-fix pass — deep audit findings (5 P1 currency mixing bugs and
+# 1 P2 architecture bug). See the deep bug audit report for details.
+# ---------------------------------------------------------------------------
+
+
+def _fake_schema_with_probabilities():
+    """Minimal CRMSchema-ish object for forecast tests."""
+    class _Stage:
+        def __init__(self, stage_id, probability):
+            self.stage_id = stage_id
+            self.label = stage_id
+            self.probability = probability
+
+    class _Pipeline:
+        def __init__(self, pipeline_id, stages):
+            self.pipeline_id = pipeline_id
+            self.label = pipeline_id
+            self.stages = stages
+
+    class _Schema:
+        pipelines = {
+            "deals": [
+                _Pipeline(
+                    "default",
+                    [
+                        _Stage("qualified", 0.2),
+                        _Stage("demo", 0.4),
+                        _Stage("proposal", 0.6),
+                        _Stage("negotiation", 0.8),
+                    ],
+                ),
+                _Pipeline(
+                    "japan",
+                    [
+                        _Stage("japan_qualified", 0.2),
+                        _Stage("japan_proposal", 0.6),
+                    ],
+                ),
+            ]
+        }
+
+    return _Schema()
+
+
+# --- Bug 14: forecast.weighted_pipeline currency mixing --------------------
+
+
+def test_weighted_pipeline_separates_jpy_and_usd():
+    """Stage-probability-weighted totals must bucket by currency —
+    summing ¥ and $ weighted amounts used to produce a meaningless
+    single 'weighted pipeline' scalar on multi-currency portals."""
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["1000000", "50000", "100000"],
+        "dealstage": ["japan_proposal", "proposal", "negotiation"],
+        "pipeline": ["japan", "default", "default"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+    })
+
+    result = forecast.weighted_pipeline(extractor, _fake_schema_with_probabilities())
+
+    # Per-currency weighted totals:
+    # JPY: ¥1_000_000 × 0.6 = ¥600_000
+    # USD: $50_000 × 0.6 + $100_000 × 0.8 = $30_000 + $80_000 = $110_000
+    assert set(result["by_currency"].keys()) == {"JPY", "USD"}
+    assert result["by_currency"]["JPY"]["weighted_value"] == pytest.approx(600_000)
+    assert result["by_currency"]["USD"]["weighted_value"] == pytest.approx(110_000)
+    assert result["by_currency"]["JPY"]["unweighted_value"] == 1_000_000
+    assert result["by_currency"]["USD"]["unweighted_value"] == 150_000
+    # Primary = USD (2 deals beats JPY's 1).
+    assert result["primary_currency"] == "USD"
+    # Back-compat flat field reflects primary currency only.
+    assert result["weighted_value"] == pytest.approx(110_000)
+    assert result["deal_count"] == 3
+
+
+def test_weighted_pipeline_no_currency_column_defaults_to_usd():
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1"],
+        "amount": ["10000"],
+        "dealstage": ["negotiation"],
+        "pipeline": ["default"],
+    })
+
+    result = forecast.weighted_pipeline(extractor, _fake_schema_with_probabilities())
+    assert result["primary_currency"] == "USD"
+    assert result["weighted_value"] == pytest.approx(8_000)  # 10k * 0.8
+    assert result["by_currency"]["USD"]["weighted_value"] == pytest.approx(8_000)
+
+
+def test_weighted_pipeline_empty_payload_shape():
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame()
+
+    result = forecast.weighted_pipeline(extractor, _fake_schema_with_probabilities())
+    assert result["weighted_value"] == 0.0
+    assert result["unweighted_value"] == 0.0
+    assert result["deal_count"] == 0
+    assert result["by_currency"] == {}
+    assert result["primary_currency"] == "USD"
+
+
+# --- Bug 15: forecast.forecast_by_category currency mixing -----------------
+
+
+def test_forecast_by_category_emits_one_row_per_category_currency():
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3", "4"],
+        "amount": ["500000", "30000", "20000", "100000"],
+        "hs_forecast_category": ["commit", "commit", "commit", "bestcase"],
+        "dealstage": ["negotiation"] * 4,
+        "pipeline": ["japan", "default", "default", "default"],
+        "deal_currency_code": ["JPY", "USD", "USD", "USD"],
+    })
+
+    df = forecast.forecast_by_category(extractor)
+
+    # Commit bucket must split into two rows: JPY and USD. Not a single
+    # row with ¥500K + $50K = $550K silently mixed.
+    commit_rows = df[df["hs_forecast_category"] == "commit"]
+    assert set(commit_rows["currency"]) == {"JPY", "USD"}
+    jpy_commit = commit_rows[commit_rows["currency"] == "JPY"].iloc[0]
+    usd_commit = commit_rows[commit_rows["currency"] == "USD"].iloc[0]
+    assert jpy_commit["total_value"] == 500_000
+    assert jpy_commit["deal_count"] == 1
+    assert usd_commit["total_value"] == 50_000
+    assert usd_commit["deal_count"] == 2
+    assert usd_commit["avg_deal_size"] == 25_000
+
+
+# --- Bug 16: revenue.mrr_arr_from_deals currency mixing --------------------
+
+
+def test_mrr_arr_separates_jpy_and_usd():
+    """Recurring revenue must bucket by currency — summing ¥ MRR and
+    $ MRR into a single scalar used to produce misleading totals."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2"],
+        "amount": ["500000", "10000"],
+        "hs_is_closed_won": ["true", "true"],
+        "hs_mrr": ["100000", "2000"],
+        "hs_arr": ["1200000", "24000"],
+        "pipeline": ["japan", "default"],
+        "deal_currency_code": ["JPY", "USD"],
+    })
+
+    result = revenue.mrr_arr_from_deals(extractor, _tr())
+
+    assert set(result["by_currency"].keys()) == {"JPY", "USD"}
+    assert result["by_currency"]["JPY"]["mrr"] == 100_000
+    assert result["by_currency"]["JPY"]["arr"] == 1_200_000
+    assert result["by_currency"]["USD"]["mrr"] == 2_000
+    assert result["by_currency"]["USD"]["arr"] == 24_000
+    # Tie on deal count (1 each) → ``max(..., key=(count, code))`` picks
+    # the alphabetically-LAST code, so USD beats JPY. This matches every
+    # other multi-currency metric in the skill for determinism.
+    assert result["primary_currency"] == "USD"
+    assert result["mrr"] == 2_000
+    assert result["arr"] == 24_000
+    assert result["deal_count"] == 2
+
+
+def test_mrr_arr_empty_payload_shape():
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame()
+
+    result = revenue.mrr_arr_from_deals(extractor, _tr())
+    assert result["mrr"] == 0.0
+    assert result["arr"] == 0.0
+    assert result["deal_count"] == 0
+    assert result["by_currency"] == {}
+    assert result["primary_currency"] == "USD"
+
+
+# --- Bug 17: revenue.revenue_by_pipeline currency mixing -------------------
+
+
+def test_revenue_by_pipeline_splits_currencies_within_pipeline():
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["1000000", "50000", "30000"],
+        "hs_is_closed_won": ["true", "true", "true"],
+        "pipeline": ["japan", "japan", "default"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+    })
+
+    df = revenue.revenue_by_pipeline(extractor, _tr())
+
+    # "japan" pipeline must emit two rows: one JPY, one USD.
+    japan_rows = df[df["pipeline"] == "japan"]
+    assert set(japan_rows["currency"]) == {"JPY", "USD"}
+    jpy_japan = japan_rows[japan_rows["currency"] == "JPY"].iloc[0]
+    usd_japan = japan_rows[japan_rows["currency"] == "USD"].iloc[0]
+    assert jpy_japan["total_revenue"] == 1_000_000
+    assert jpy_japan["deal_count"] == 1
+    assert usd_japan["total_revenue"] == 50_000
+
+
+# --- Bug 18: pipeline.pipeline_by_stage currency mixing --------------------
+
+
+def test_pipeline_by_stage_separates_currencies():
+    """Mixed-currency stages must emit separate rows per currency —
+    a ¥1M deal and a $50K deal in "Proposal" used to render as
+    'Proposal: $525K average' instead of two distinct rows."""
+    extractor = MagicMock()
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["1000000", "50000", "30000"],
+        "dealstage": ["proposal", "proposal", "negotiation"],
+        "pipeline": ["default", "default", "default"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+    })
+
+    from hubspot_revops.schema.models import (
+        CRMSchema,
+        Pipeline,
+        PipelineStage,
+    )
+    schema = CRMSchema(
+        objects={},
+        pipelines={
+            "deals": [
+                Pipeline(
+                    pipeline_id="default",
+                    label="Sales",
+                    display_order=0,
+                    stages=[
+                        PipelineStage(stage_id="proposal", label="Proposal", display_order=0),
+                        PipelineStage(stage_id="negotiation", label="Negotiation", display_order=1),
+                    ],
+                ),
+            ],
+        },
+    )
+
+    df = pipeline.pipeline_by_stage(extractor, schema)
+
+    # "proposal" must have two rows: JPY and USD.
+    proposal_rows = df[df["dealstage"] == "proposal"]
+    assert len(proposal_rows) == 2
+    assert set(proposal_rows["currency"]) == {"JPY", "USD"}
+    jpy_proposal = proposal_rows[proposal_rows["currency"] == "JPY"].iloc[0]
+    usd_proposal = proposal_rows[proposal_rows["currency"] == "USD"].iloc[0]
+    assert jpy_proposal["total_value"] == 1_000_000
+    assert usd_proposal["total_value"] == 50_000
+    # No cross-currency average (the old bug was a $525K "average").
+    assert jpy_proposal["avg_value"] == 1_000_000
+    assert usd_proposal["avg_value"] == 50_000
+
+
+# --- Bug 19: ActivityExtractor object_type mutation (P2) -------------------
+
+
+def test_activity_extractor_restores_object_type_after_call():
+    """``get_activities`` must not permanently overwrite self.object_type.
+    A subsequent direct call to self.search() or self.count() would
+    otherwise silently query the last activity type instead of the
+    caller's intended object."""
+    from hubspot_revops.extractors.activities import ActivityExtractor
+
+    client = MagicMock()
+    client.search_objects.return_value = SimpleNamespace(
+        results=[], paging=None, total=0
+    )
+
+    extractor = ActivityExtractor(client)
+    extractor.object_type = ""  # fresh instance starts empty
+    original = extractor.object_type
+
+    extractor.get_activities("meetings", _tr())
+    assert extractor.object_type == original, (
+        "get_activities must restore self.object_type to its previous value"
+    )
+
+    extractor.get_activities("calls", _tr())
+    assert extractor.object_type == original
+
+
+def test_activity_extractor_restores_object_type_on_exception():
+    """Even if every fallback raises, self.object_type must be restored."""
+    from hubspot_revops.extractors.activities import ActivityExtractor
+
+    client = MagicMock()
+    client.search_objects.side_effect = Exception("502 Bad Gateway")
+
+    extractor = ActivityExtractor(client)
+    extractor.object_type = "sentinel"
+
+    result = extractor.get_activities("meetings", _tr())
+    assert result.empty
+    assert extractor.object_type == "sentinel", (
+        "try/finally must restore object_type even when every fallback raises"
+    )
