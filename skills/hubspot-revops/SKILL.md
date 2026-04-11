@@ -178,30 +178,40 @@ After generating a report, always:
 **Team:** Rep scorecard, win rate by rep, cycle length by rep, pipeline per rep  
 **Forecast:** Weighted pipeline, forecast categories, commit vs. best case  
 
-## Running multiple reports — run them sequentially, not in parallel
+## Running multiple reports — cross-process rate limiting
 
 HubSpot's CRM API rate limits are **per portal**, not per process. The
-skill's token-bucket rate limiter lives inside the current Python
-process, so launching several CLI invocations in parallel (one per
-report) gives every process its own independent limiter and they
-collectively blow past HubSpot's ceiling, triggering 429 responses that
-exhaust the retry policy and surface as `FALLBACK_TO_MCP` banners on
-the later reports in the batch.
+skill handles this with a cross-process token bucket backed by a JSON
+state file at `~/.hubspot_revops/rate_limit.general.state.json` (and a
+separate `rate_limit.search.state.json` for the stricter 5 req/s Search
+API bucket). Every HubSpotClient instance — across every parallel
+Python process — coordinates through those shared files via
+`fcntl.flock` exclusive locks, so launching several CLI invocations
+simultaneously no longer blows past HubSpot's ceiling.
 
-**Run reports sequentially instead:**
+**Parallel invocation now works:**
 
 ```bash
-# Good — one at a time
-python -m hubspot_revops.cli report pipeline --period Q1-2026
-python -m hubspot_revops.cli report revenue  --period Q1-2026
-python -m hubspot_revops.cli report team     --period Q1-2026
-python -m hubspot_revops.cli report forecast --period Q1-2026
+# All four run in parallel; the shared bucket serializes their API
+# calls so the portal never sees more than 100 req/10s in aggregate.
+python -m hubspot_revops.cli report pipeline --period Q1-2026 &
+python -m hubspot_revops.cli report revenue  --period Q1-2026 &
+python -m hubspot_revops.cli report team     --period Q1-2026 &
+python -m hubspot_revops.cli report forecast --period Q1-2026 &
+wait
 ```
 
-Do **not** background nine CLI commands with `&` or launch them in
-parallel from an agent loop. If you need a multi-report batch, invoke
-them one after the other — each report is already internally
-parallelism-free and respects the rate limiter within its own process.
+**Caveat:** parallel invocation doesn't make things faster — the
+shared bucket serializes API calls, so the total wall-clock time is
+roughly the same as running them sequentially. Parallelism is useful
+when you want independent processes (e.g. an agent loop that
+launches reports as tool calls) to not step on each other, not as a
+speedup.
+
+On Windows (no `fcntl`) or any environment where
+`~/.hubspot_revops/` isn't writable, the skill falls back to
+in-process rate limiting. In that fallback mode, **parallel
+invocation will 429** — run sequentially instead.
 
 ## Security
 
