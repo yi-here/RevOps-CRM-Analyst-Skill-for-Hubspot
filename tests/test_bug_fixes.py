@@ -771,3 +771,120 @@ def test_base_extractor_count_missing_total_returns_zero():
     extractor.object_type = "contacts"
 
     assert extractor.count([{"filters": []}]) == 0
+
+
+# --- Bug 12: avg_deal_size currency mixing ---------------------------------
+#
+# Sibling of Bug 10: ``pipeline.avg_deal_size`` used to average every won
+# deal's amount regardless of ``deal_currency_code``. A ¥1,000,000 deal
+# and a $50,000 deal produced a meaningless "$525,000 avg deal size".
+# The fix mirrors total_pipeline_value — bucket by currency, expose
+# by_currency + primary_currency, keep back-compat flat fields so
+# pipeline_velocity() and the exec summary template still work.
+
+
+def test_avg_deal_size_separates_jpy_and_usd():
+    """Multi-currency won deals must never be averaged into a single scalar."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2", "3"],
+        "amount": ["1000000", "40000", "60000"],
+        "hs_is_closed_won": ["true", "true", "true"],
+        "pipeline": ["japan", "default", "default"],
+        "deal_currency_code": ["JPY", "USD", "USD"],
+    })
+
+    result = pipeline.avg_deal_size(extractor, _tr())
+
+    assert set(result["by_currency"].keys()) == {"JPY", "USD"}
+    # JPY: one deal at 1M — avg == 1M
+    assert result["by_currency"]["JPY"]["avg_deal_size"] == 1_000_000
+    assert result["by_currency"]["JPY"]["total_revenue"] == 1_000_000
+    assert result["by_currency"]["JPY"]["deal_count"] == 1
+    # USD: two deals averaging 50k
+    assert result["by_currency"]["USD"]["avg_deal_size"] == 50_000
+    assert result["by_currency"]["USD"]["total_revenue"] == 100_000
+    assert result["by_currency"]["USD"]["deal_count"] == 2
+    # Primary = whichever has the most deals (USD: 2).
+    assert result["primary_currency"] == "USD"
+    # Back-compat flat field reflects primary currency only — never a
+    # cross-currency average like the old (1_000_000+40_000+60_000)/3.
+    assert result["avg_deal_size"] == 50_000
+    assert result["total_revenue"] == 100_000
+    assert result["deal_count"] == 2
+
+
+def test_avg_deal_size_no_currency_column_defaults_to_usd():
+    """Back-compat: portals without deal_currency_code still work."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame({
+        "id": ["1", "2"],
+        "amount": ["10000", "20000"],
+        "hs_is_closed_won": ["true", "true"],
+    })
+
+    result = pipeline.avg_deal_size(extractor, _tr())
+    assert result["primary_currency"] == "USD"
+    assert result["avg_deal_size"] == 15_000
+    assert result["total_revenue"] == 30_000
+    assert result["deal_count"] == 2
+    assert result["by_currency"]["USD"]["avg_deal_size"] == 15_000
+
+
+def test_avg_deal_size_empty_payload_shape():
+    """Empty extractor must return every key callers rely on."""
+    extractor = MagicMock()
+    extractor.get_closed_deals.return_value = pd.DataFrame()
+
+    result = pipeline.avg_deal_size(extractor, _tr())
+    assert result["avg_deal_size"] == 0.0
+    assert result["total_revenue"] == 0.0
+    assert result["deal_count"] == 0
+    assert result["by_currency"] == {}
+    assert result["primary_currency"] == "USD"
+
+
+def test_pipeline_velocity_reads_back_compat_avg_deal_size():
+    """pipeline_velocity() must still resolve ads['avg_deal_size'] to a
+    scalar after the multi-currency refactor, otherwise the velocity
+    formula crashes on multi-currency portals."""
+    extractor = MagicMock()
+    # Open deals for total_pipeline_value.
+    extractor.get_open_deals.return_value = pd.DataFrame({
+        "id": ["1", "2"],
+        "amount": ["5000", "7000"],
+        "dealstage": ["qualified", "demo"],
+        "pipeline": ["default", "default"],
+        "deal_currency_code": ["USD", "USD"],
+    })
+    # The API-level ``won_only=True`` flag returns only won deals, so
+    # the MagicMock must honour it — otherwise avg_deal_size sees the
+    # loss row and the test asserts the wrong scalar. Simulate the two
+    # server-side filter paths via ``side_effect``.
+    all_closed = pd.DataFrame({
+        "id": ["1", "2", "3", "4"],
+        "amount": ["1000000", "40000", "60000", "1000"],
+        "hs_is_closed_won": ["true", "true", "true", "false"],
+        "pipeline": ["japan", "default", "default", "default"],
+        "deal_currency_code": ["JPY", "USD", "USD", "USD"],
+        "createdate": ["2026-01-01", "2026-01-01", "2026-01-01", "2026-01-01"],
+        "closedate": ["2026-02-01", "2026-02-01", "2026-02-01", "2026-02-01"],
+    })
+    won_only = all_closed[all_closed["hs_is_closed_won"] == "true"].reset_index(drop=True)
+
+    def _closed_side_effect(time_range, won_only_flag=False, **_kwargs):
+        return won_only if won_only_flag else all_closed
+
+    # Match the real signature: (time_range, won_only=False, properties=None).
+    extractor.get_closed_deals.side_effect = lambda *args, **kwargs: (
+        won_only if kwargs.get("won_only") or (len(args) > 1 and args[1]) else all_closed
+    )
+
+    result = pipeline.pipeline_velocity(extractor, _tr())
+    # velocity formula is (deals * win_pct * avg_size) / avg_cycle — the
+    # important bit is that we don't crash pulling avg_deal_size from
+    # the multi-currency payload, and that avg_size is the USD primary
+    # scalar (50_000 = (40k+60k)/2), not a cross-currency mash-up.
+    assert result["avg_deal_size"] == 50_000
+    assert result["open_deals"] == 2
+    assert result["win_rate"] == 75.0  # 3W / 1L across all currencies

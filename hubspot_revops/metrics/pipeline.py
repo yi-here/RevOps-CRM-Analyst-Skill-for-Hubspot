@@ -175,18 +175,65 @@ def avg_deal_size(
     time_range: TimeRange,
     pipeline_filter: str | None = None,
 ) -> dict:
-    """Calculate average deal size for won deals in a period."""
+    """Calculate average deal size for won deals in a period, grouped by currency.
+
+    Returns a payload shaped as::
+
+        {
+            "by_currency": {
+                "USD": {"avg_deal_size": ..., "total_revenue": ..., "deal_count": ...},
+                "JPY": {...},
+            },
+            "primary_currency": "USD",  # highest deal count, alphabetical tiebreak
+            # Back-compat / primary-currency convenience fields consumed by
+            # pipeline_velocity() and the executive summary template:
+            "avg_deal_size": float,
+            "total_revenue": float,
+            "deal_count": int,
+        }
+
+    Previously this averaged every won deal's amount regardless of
+    ``deal_currency_code`` — a ¥1,000,000 JPY deal and a $50,000 USD
+    deal would produce an "average" of $525,000, which is meaningless.
+    Mirrors ``total_pipeline_value`` and ``revenue.closed_revenue`` so
+    every money metric in the skill buckets currencies consistently.
+    """
     won = _filter_pipeline(
         deal_extractor.get_closed_deals(time_range, won_only=True), pipeline_filter
     )
+    empty_payload = {
+        "by_currency": {},
+        "primary_currency": DEFAULT_CURRENCY,
+        "avg_deal_size": 0.0,
+        "total_revenue": 0.0,
+        "deal_count": 0,
+    }
     if won.empty:
-        return {"avg_deal_size": 0.0, "total_revenue": 0.0, "deal_count": 0}
+        return empty_payload
 
+    won = _attach_currency(won)
     won["amount"] = to_numeric_series(won, "amount")
+
+    by_currency: dict[str, dict] = {}
+    for code, group in won.groupby("currency"):
+        amounts = group["amount"]
+        by_currency[str(code)] = {
+            "avg_deal_size": float(amounts.mean()) if len(group) else 0.0,
+            "total_revenue": float(amounts.sum()),
+            "deal_count": int(len(group)),
+        }
+
+    # Primary currency = whichever has the most deals. Ties broken
+    # alphabetically for determinism (matches total_pipeline_value and
+    # revenue.closed_revenue).
+    primary = max(by_currency.items(), key=lambda kv: (kv[1]["deal_count"], kv[0]))[0]
+    primary_stats = by_currency[primary]
     return {
-        "avg_deal_size": won["amount"].mean(),
-        "total_revenue": won["amount"].sum(),
-        "deal_count": len(won),
+        "by_currency": by_currency,
+        "primary_currency": primary,
+        "avg_deal_size": primary_stats["avg_deal_size"],
+        "total_revenue": primary_stats["total_revenue"],
+        "deal_count": primary_stats["deal_count"],
     }
 
 

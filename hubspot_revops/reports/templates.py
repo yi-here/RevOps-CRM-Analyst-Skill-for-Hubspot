@@ -83,8 +83,26 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
             f"({int(stats['deal_count'])} deals)"
             for code, stats in sorted(open_by_currency.items())
         )
+        open_avg_lines = "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats['avg_deal_size'], code)}"
+            for code, stats in sorted(open_by_currency.items())
+        )
     else:
         pipeline_lines = _fmt_currency(p.get("total_value", 0))
+        open_avg_lines = _fmt_currency(p.get("avg_deal_size", 0))
+
+    # Same treatment for won-deal avg deal size — averaging ¥ and $
+    # amounts into a single scalar used to produce a meaningless
+    # "$525K" on JPY+USD portals.
+    ads_by_currency = ads.get("by_currency") or {}
+    if len(ads_by_currency) > 1:
+        ads_avg_lines = "<br>".join(
+            f"{code}: {_fmt_currency_with_code(stats['avg_deal_size'], code)} "
+            f"({int(stats['deal_count'])} deals)"
+            for code, stats in sorted(ads_by_currency.items())
+        )
+    else:
+        ads_avg_lines = _fmt_currency(ads.get("avg_deal_size", 0))
 
     return f"""# Executive Summary
 **Period:** {_period_str(tr)}
@@ -95,7 +113,7 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
 | Open Pipeline | {pipeline_lines} |
 | Open Deals | {p['total_deals']} |
 | Weighted Pipeline | {_fmt_currency(wt['weighted_value'])} |
-| Avg Deal Size | {_fmt_currency(p.get('avg_deal_size', 0))} |
+| Avg Deal Size | {open_avg_lines} |
 
 ## Performance
 | Metric | Value |
@@ -103,7 +121,7 @@ def format_executive_summary(data: dict, tr: TimeRange) -> str:
 | Closed Revenue | {revenue_lines} |
 | Deals Won | {wr['won']} |
 | Win Rate | {wr['win_rate']}% |
-| Avg Deal Size (Won) | {_fmt_currency(ads['avg_deal_size'])} |
+| Avg Deal Size (Won) | {ads_avg_lines} |
 | Avg Sales Cycle | {vel['avg_cycle_days']:.0f} days |
 | Pipeline Velocity | {_fmt_currency(vel['velocity_per_month'])}/month |
 """
