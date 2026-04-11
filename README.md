@@ -422,38 +422,165 @@ python -m hubspot_revops.cli schema
 
 ## Architecture
 
+The skill is a layered, synchronous pipeline: **Auth → Client → Schema → Extractors → Metrics → Reports**. Each layer is independently testable, deterministic, and architecturally read-only.
+
 ```
-hubspot_revops/
-├── client.py              # HubSpot API client — auth, rate limiting, retry
-├── schema/
-│   ├── discovery.py       # Auto-discover CRM objects, properties, pipelines
-│   ├── models.py          # Pydantic models for schema elements
-│   └── cache.py           # 24-hour schema cache to avoid API waste
-├── extractors/
-│   ├── base.py            # Base extractor with pagination & search
-│   ├── deals.py           # Deal extraction with pipeline-aware filtering
-│   ├── contacts.py        # Contact extraction with lifecycle filtering
-│   ├── companies.py       # Company extraction
-│   ├── activities.py      # Engagement extraction (calls, emails, meetings)
-│   ├── pipelines.py       # Pipeline & stage metadata
-│   ├── owners.py          # HubSpot owner/rep data
-│   └── custom_objects.py  # Dynamic custom object extraction
-├── metrics/
-│   ├── pipeline.py        # Pipeline value, velocity, conversion, coverage
-│   ├── revenue.py         # Closed revenue, MRR/ARR, by rep/pipeline
-│   ├── conversion.py      # Funnel conversion rates across lifecycle
-│   ├── activity.py        # Engagement metrics by type and owner
-│   ├── team.py            # Rep scorecard and performance metrics
-│   └── forecast.py        # Weighted pipeline and forecast categories
-├── reports/
-│   ├── generator.py       # Orchestrates extraction → metrics → formatting
-│   ├── templates.py       # Markdown report templates
-│   └── charts.py          # Optional matplotlib chart generation
-├── nl_interface.py        # Natural language question → metric routing
-└── cli.py                 # CLI entry point (schema / report / ask)
+┌──────────────┐   ┌──────────┐   ┌────────┐   ┌────────────┐   ┌─────────┐   ┌─────────┐
+│ CLI / NL query│→ │ Schema   │→ │ Extract │→ │  Metrics    │→ │ Reports │→ │Markdown │
+│ + TimeRange   │  │ (cached) │  │ (search │  │  (pandas    │  │(templates│  │  / CSV  │
+└──────────────┘   └──────────┘   │  API)   │  │  groupby)   │  │  + chart)│  └─────────┘
+                                   └────────┘   └────────────┘   └─────────┘
 ```
 
-See [PLAN.md](PLAN.md) for the full implementation plan with API details, data flow, and phased roadmap.
+### Package Layout
+
+```
+hubspot_revops/
+├── auth.py                # OAuth 2.0 flow with HMAC CSRF state, atomic token cache
+│                          # (temp file + os.replace), refresh-token fallback to
+│                          # interactive flow if rotated
+├── client.py              # HubSpot SDK wrapper — token-bucket rate limiter
+│                          # (100 req/10s general, 5 req/1s Search API), 5-attempt
+│                          # exponential retry (1s → 16s) for 429/5xx
+├── cli.py                 # CLI entry: schema / report / ask; fiscal-quarter,
+│                          # calendar-month, and rolling-window period parsing
+├── nl_interface.py        # Keyword-based question → report routing (no NLU dep)
+│
+├── schema/
+│   ├── discovery.py       # Discovers objects, properties, pipelines, stages
+│   │                      # (won/closed/probability), owners, associations
+│   ├── models.py          # Pydantic models: CRMSchema, Pipeline, PipelineStage,
+│   │                      # Owner, PropertySchema, ObjectSchema, AssociationDef
+│   ├── cache.py           # 24h JSON schema cache (TTL via HUBSPOT_SCHEMA_CACHE_TTL)
+│   └── stage_ids.py       # Pipeline ID resolution + stage label disambiguation
+│                          # across multi-pipeline portals
+│
+├── extractors/
+│   ├── base.py            # BaseExtractor with paginated search (after cursor),
+│   │                      # TimeRange dataclass, batched associations (100/req)
+│   ├── deals.py           # 27 deal properties incl. hs_acv/arr/mrr/tcv and
+│   │                      # deal_currency_code; variant property sets per report
+│   ├── contacts.py        # Lifecycle-stage date properties for funnel rates
+│   ├── companies.py       # Company data
+│   ├── activities.py      # calls / emails / meetings / notes / tasks with
+│   │                      # per-type date property fallback chain
+│   ├── pipelines.py       # Pipeline + stage metadata
+│   ├── owners.py          # HubSpot owners / reps
+│   └── custom_objects.py  # Dynamic custom-object extraction
+│
+├── metrics/
+│   ├── _utils.py          # to_numeric_series / to_bool_series coercion guards
+│   │                      # (crash-proof on empty DataFrames or missing columns)
+│   ├── _quality.py        # Stale open deals + zero-engagement "ghost" deals
+│   ├── pipeline.py        # Total value, by stage, win rate, avg deal size,
+│   │                      # sales-cycle length, velocity formula
+│   ├── revenue.py         # Multi-currency closed revenue, by owner, by pipeline,
+│   │                      # MRR/ARR — never sums across currencies
+│   ├── conversion.py      # Lead → MQL → SQL → Opp → Customer funnel with
+│   │                      # graceful degradation on API errors
+│   ├── activity.py        # Engagement summary + by-owner across 5 activity types
+│   ├── team.py            # Per-rep, per-currency scorecard (one row per
+│   │                      # owner × currency pair)
+│   ├── forecast.py        # Stage-probability-weighted pipeline + category buckets
+│   ├── forecast_bucket.py # Monthly Commit / Highly Likely / Best Case with
+│   │                      # probability normalization (round to 2dp)
+│   ├── closed_lost.py     # Per-rep lost scorecard, reason breakdown, ghost count,
+│   │                      # lost-reason coverage warning (< 50% threshold)
+│   └── meeting_history.py # Meetings-to-close, per-rep won vs. lost, top lost-deal
+│                          # effort sinks
+│
+└── reports/
+    ├── generator.py       # ReportGenerator — orchestrates extraction → metrics
+    │                      # → template formatting; resolves --pipeline flag
+    ├── templates.py       # Markdown templates with per-currency formatting
+    │                      # (USD $, JPY ¥, EUR €, GBP £), period headers,
+    │                      # snapshot-vs-period disclaimers
+    └── charts.py          # Optional chart output
+```
+
+### Data Flow
+
+```
+cli.parse_time_range("Q1-2026")
+    → TimeRange(start, end)  # microsecond precision at quarter end
+         │
+         ▼
+ReportGenerator._resolve_pipeline(name_or_id)
+    → stage_ids.resolve_pipeline_id()  # exact → case-insensitive → substring
+         │
+         ▼
+Extractor.search_in_time_range(properties=[...])
+    → paginated HubSpot Search API (after cursor, max 10k)
+         │
+         ▼
+metrics/*.py  →  pandas DataFrame groupby / sum / mean
+    (deterministic, alphabetical tiebreakers, multi-currency isolated)
+         │
+         ▼
+reports/templates.format_*_report()
+    → Markdown with per-currency formatting, insights, risks, actions
+```
+
+See [PLAN.md](PLAN.md) for the full implementation plan and phased roadmap.
+
+---
+
+## Engineering Highlights
+
+These are the quiet correctness decisions that separate "code that runs" from "reports you can show the CFO." Each one exists because an earlier version got bitten — and each one is covered by tests in `tests/`.
+
+### 1. Multi-Currency Isolation — Never Sum Across Currencies
+
+HubSpot portals with deals in USD, JPY, EUR, and GBP quietly produce nonsense if you `sum(amount)` — ¥990,000 is not $990,000. Every money metric in this skill (`metrics/revenue.py`, `metrics/team.py`, `metrics/closed_lost.py`, `metrics/forecast_bucket.py`) buckets by `deal_currency_code` and returns a `by_currency: {USD: ..., JPY: ..., EUR: ...}` dict. A `primary_currency` field (highest deal count, alphabetical tiebreak) is exposed for back-compat callers that expect a single scalar. Team scorecards emit **one row per `(owner_id, currency)` pair** so rep performance is never cross-currency-smeared.
+
+### 2. Stage Label Disambiguation for Multi-Pipeline Portals
+
+Portals running "Sales" and "Japan" pipelines in parallel frequently have identical stage labels (`Qualified`, `Proposal`) in both. A naive `groupby(stage_label)` double-counts. `schema/stage_ids.py:get_pipeline_stage_labels()` tracks `(pipeline_id, stage_id)` tuples and renders `"Qualified (Sales)"` vs. `"Qualified (Japan)"` in reports. This is not standard HubSpot SDK behavior.
+
+### 3. Consistent Won-Deal Filter
+
+A real prior bug: the team scorecard applied `to_bool_series(hs_is_closed_won)` in Python, while revenue passed `won_only=True` to the HubSpot API filter. The two disagreed on how HubSpot serializes booleans, producing a ~$25K gap between team totals and company totals on one portal. `revenue._fetch_won()` now fetches closed deals once and applies the Python-side filter, so both code paths compute against identical data.
+
+### 4. Probability Normalization for Forecast Bucketing
+
+HubSpot returns stage probabilities as clean floats (`0.8`), noisy floats (`0.80000000000000004`), percentage integers (`80`), or already-normalized fractions. `forecast_bucket._normalize_probability()` detects the form and rounds to two decimals so a `>= 0.8` threshold reliably fires on "commit" stages. Before this, late-stage deals were being silently classified as Best Case.
+
+### 5. Engagement Date Fallback
+
+HubSpot's Search API doesn't consistently honour the same date filter across engagement types — `hs_meeting_start_time` works for meetings but not emails. `ActivityExtractor` tries the type-specific field first, falls back to `hs_lastmodifieddate`, then to an unfiltered search. This fixes the "activity report always shows 0" bug that made engagement metrics useless on some portals.
+
+### 6. Crash-Proof Pandas Helpers
+
+`metrics/_utils.py:to_numeric_series()` / `to_bool_series()` guarantee a valid `pd.Series` even when the DataFrame is empty or the column is missing. Without these, downstream `.sum()`, `.mean()`, `.fillna()` calls throw `AttributeError` on low-data portals. This was the root cause of the team-scorecard crash on sandbox accounts.
+
+### 7. Quarter-End Microsecond Precision
+
+`cli.parse_time_range("Q1-2026")` anchors the end date to `23:59:59.999999` on the final day of the quarter, not midnight. Otherwise deals closed between noon and midnight on 31 March silently drop from the Q1 report. Same care is taken for `month` / `last-month` / named months.
+
+### 8. Ghost Deal & Data-Quality Detection
+
+`metrics/_quality.py` surfaces two hygiene issues the HubSpot UI hides:
+
+- **Stale open deals** — `closedate` in the past but `hs_is_closed = false`
+- **Ghost deals** — closed-lost deals with zero associated meetings, calls, emails, or notes ("never actually worked")
+
+`metrics/closed_lost.py` additionally warns when fewer than 50% of lost deals have a `closed_lost_reason` populated, because the reason breakdown is unreliable below that threshold.
+
+### 9. Rate Limiter with Separate Search-API Bucket
+
+`client.py` runs two independent token buckets: 100 req/10s for the general CRM API and 5 req/1s for the Search API (which has stricter limits HubSpot doesn't document loudly). Paired with a 5-attempt exponential-backoff retry (1s → 2s → 4s → 8s → 16s) for 429/5xx, the client survives the contacts-search 502 spikes that crash naive wrappers.
+
+### 10. Atomic OAuth Token Cache
+
+`auth.py` saves the refresh token via temp file + `os.replace()` so a process dying mid-write can never corrupt the cache. CSRF state tokens are HMAC-signed. If the refresh token is rotated out from under us, the client falls back to the interactive flow instead of erroring. Tokens live at `~/.hubspot_revops/tokens.json` with `0600` permissions.
+
+### 11. Locked Schema, Deterministic Aggregation
+
+Schema is discovered once per 24h and cached; every metric is computed against that snapshot. Pandas `groupby`/`sum` operations are deterministic. Tiebreakers (e.g. primary currency selection) are alphabetical. Reports generated from the same HubSpot snapshot are byte-exact across runs — critical for audit-grade RevOps reporting where week-over-week comparisons need stable columns.
+
+### 12. Architecturally Read-Only
+
+There are **no HubSpot write methods anywhere in the package**. Not in `client.py`, not in the extractors, not in the reports. The skill cannot create, update, or delete CRM records — even under prompt injection — because the code for doing so doesn't exist. This is a stronger guarantee than "the agent is configured to only read."
 
 ---
 
